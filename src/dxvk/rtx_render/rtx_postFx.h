@@ -61,6 +61,14 @@ namespace dxvk {
       const uint32_t frameIdx,
       const Resources::RaytracingOutput& rtOutput);
 
+    // NTSC/VHS composite (frozen pipeline). Post-tonemap, in-place on m_finalOutput.
+    void dispatchNtsc(
+      Rc<RtxContext> ctx,
+      Rc<DxvkSampler> linearSampler,
+      const uvec2& mainCameraResolution,
+      const uint32_t frameIdx,
+      const Resources::RaytracingOutput& rtOutput);
+
     void dispatchHighlighting(
       Rc<RtxContext> ctx,
       const Resources::RaytracingOutput& rtOutput,
@@ -74,6 +82,7 @@ namespace dxvk {
     inline bool isMotionBlurEnabled() const { return enable() && enableMotionBlur() && motionBlurSampleCount() > 0 && exposureFraction() > 0.0f; }
     inline bool isChromaticAberrationEnabled() const { return enable() && enableChromaticAberration() && chromaticAberrationAmount() > 0.0f; }
     inline bool isVignetteEnabled() const { return enable() && enableVignette() && vignetteIntensity() > 0.0f; }
+    inline bool isNtscEnabled() const { return ntscEnable(); }
 
     RTX_OPTION_ARGS("rtx.postfx", bool, enable, true, "Enables post-processing effects.",
                     args.environment = "RTX_POST_FX_ENABLE",
@@ -86,6 +95,20 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx.postfx", bool, enableVignette, true, "Enables vignette post-processing effect.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx.postfx", bool, desaturateOthersOnHighlight, true, "If true, desaturare all objects that are not highlighted.");
+
+    // --- NTSC/VHS composite look (frozen; Kim2091/ntsc-simulator aligned) ---
+    RTX_OPTION_ARGS("rtx.ntsc", bool, ntscEnable, false,
+                    "Enable the NTSC/VHS composite look.",
+                    args.environment = "RTX_NTSC_ENABLE",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION("rtx.ntsc", float, ntscLumaBW,     2.80f,  "Luma bandwidth MHz (SP~3.0, EP~1.6).");
+    RTX_OPTION("rtx.ntsc", float, ntscColorBW,  420.00f,  "Color-under chroma bandwidth kHz (300..500).");
+    RTX_OPTION("rtx.ntsc", float, ntscRinging,    0.30f,  "Edge ringing / playback peaking.");
+    RTX_OPTION("rtx.ntsc", float, ntscGhost,      0.10f,  "Multipath ghost mix.");
+    RTX_OPTION("rtx.ntsc", float, ntscTapeTrail,  0.66f,  "Tape trail comet tail (rightward IIR), 0..1.");
+    RTX_OPTION("rtx.ntsc", float, ntscHeadSmear,  0.22f,  "Head-switching banded luma blur.");
+    RTX_OPTION("rtx.ntsc", float, ntscLumaNoise,  0.012f, "Luminance-dependent grain.");
+    RTX_OPTION("rtx.ntsc", float, ntscVertSoften, 0.40f,  "Vertical softening.");
 
   private:
     Rc<vk::DeviceFn> m_vkd;
