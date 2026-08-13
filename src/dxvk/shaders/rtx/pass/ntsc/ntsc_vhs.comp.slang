@@ -1,13 +1,21 @@
 /*
- * NTSC/VHS composite post-process. TWO passes (per Kim's note: noise + rainbow
- * must be UNDERNEATH the blur):
- *   pass 0 (encode): NTSC subcarrier decode -> luma/chroma (rainbow + dot crawl),
- *                    edge ringing, and injected luma noise. No blur. -> intermediate
- *   pass 1 (blur):   read the encoded signal and apply the playback blur
- *                    (vertical softness, head-switch smear, tape trail) + ghosting,
- *                    dropout, head-switch band, vignette. -> final
- * Processed on a fixed NTSC grid (NW x NH) regardless of output resolution.
- * Place at: src/dxvk/shaders/rtx/pass/ntsc/ntsc_vhs.comp.slang
+ * NTSC/VHS tape-path post-process.
+ *
+ * The source texture is post-tonemap linear RGB, while the Rust simulator
+ * operates on gamma-coded RGB inside a composite signal.  Reconstructing a
+ * 4x-fsc composite waveform from a normal render target is both undersampled
+ * and needlessly prone to dot-crawl/rainbow artifacts.  This shader therefore
+ * applies the equivalent tape path directly in sRGB/YIQ space:
+ *
+ *   pass 0: luma/color-under bandwidth -> luma edge ringing
+ *   pass 1: head-wear smear -> band-limited luma noise
+ *   pass 2: tape dropout
+ *   pass 3: causal luma-only tape trail -> linear RGB
+ *
+ * The bandwidth filters use the same normalized windowed-sinc construction as
+ * Kim2091/ntsc-simulator, evaluated at the NTSC active-line sample spacing.
+ * This preserves the intended VHS color softening without synthesizing a
+ * subcarrier that the output image cannot represent faithfully.
  */
 #include "rtx/pass/ntsc/ntsc_vhs.h"
 
@@ -21,118 +29,277 @@ layout(push_constant)
 ConstantBuffer<NtscVhsArgs> cb;
 
 static const float PI = 3.14159265f;
+static const float TAU = 6.28318531f;
 static const float3 LUMA = float3(0.299f, 0.587f, 0.114f);
-static const float NW = 640.0f;   // luma samples per line (NTSC active)
-static const float NH = 480.0f;   // visible lines
+static const float ACTIVE_SAMPLES = 754.0f;
+static const float SAMPLE_RATE = 14318180.24f;
+static const float NYQUIST = SAMPLE_RATE * 0.5f;
 
-float  hash(float2 v)  { return frac(sin(dot(v, float2(12.9898f, 78.233f))) * 43758.5453f); }
-float  hash3(float3 v) { return frac(sin(dot(v, float3(12.9898f, 78.233f, 37.719f))) * 43758.5453f); }
-float3 toYIQ(float3 c) { return float3(dot(c,LUMA), dot(c,float3(0.596f,-0.274f,-0.322f)), dot(c,float3(0.211f,-0.523f,0.312f))); }
-float3 toRGB(float3 v) { return float3(dot(v,float3(1.0f,0.956f,0.621f)), dot(v,float3(1.0f,-0.272f,-0.647f)), dot(v,float3(1.0f,-1.106f,1.703f))); }
-float3 tex(float2 uv)  { return InColorSampler.SampleLevel(uv, 0.0f).rgb; }
+float hash(float2 v) {
+  return frac(sin(dot(v, float2(12.9898f, 78.233f))) * 43758.5453f);
+}
+
+float hash3(float3 v) {
+  return frac(sin(dot(v, float3(12.9898f, 78.233f, 37.719f))) * 43758.5453f);
+}
+
+float3 toYIQ(float3 c) {
+  return float3(
+    dot(c, LUMA),
+    dot(c, float3(0.595901f, -0.274557f, -0.321344f)),
+    dot(c, float3(0.211537f, -0.522736f, 0.311200f)));
+}
+
+float3 toRGB(float3 v) {
+  return float3(
+    dot(v, float3(1.0f, 0.956f, 0.621f)),
+    dot(v, float3(1.0f, -0.272f, -0.647f)),
+    dot(v, float3(1.0f, -1.106f, 1.703f)));
+}
+
+float3 linearToSrgb(float3 c) {
+  const float3 nonNegative = max(c, 0.0f);
+  const float3 low = 12.92f * nonNegative;
+  const float3 high = 1.055f * pow(nonNegative, 1.0f / 2.4f) - 0.055f;
+  const float3 lowRegion = 1.0f - step(0.0031308f, nonNegative);
+  return lerp(high, low, lowRegion);
+}
+
+float3 srgbToLinear(float3 c) {
+  const float3 nonNegative = max(c, 0.0f);
+  const float3 low = nonNegative / 12.92f;
+  const float3 high = pow((nonNegative + 0.055f) / 1.055f, 2.4f);
+  const float3 lowRegion = 1.0f - step(0.04045f, nonNegative);
+  return lerp(high, low, lowRegion);
+}
+
+float3 sampleColor(float2 uv) {
+  return InColorSampler.SampleLevel(uv, 0.0f).rgb;
+}
+
+float3 sampleDisplayColor(float2 uv) {
+  return linearToSrgb(sampleColor(uv));
+}
+
+float sampleLuma(float2 uv) {
+  return dot(sampleColor(uv), LUMA);
+}
+
+float sampleDisplayLuma(float2 uv) {
+  return dot(sampleDisplayColor(uv), LUMA);
+}
+
+float frameNumber() {
+  return floor(cb.time * 29.97f) + float(cb.frameIdx & 0xffffu);
+}
+
+float fieldNumber() {
+  return floor(cb.time * 59.94f) + float(cb.frameIdx & 0xffffu) * 2.0f;
+}
+
+// Same Hamming-windowed sinc definition used by effects.rs::design_lowpass.
+float lowpassWeight(int offset, float cutoffHz, int taps) {
+  const float half = 0.5f * float(taps - 1);
+  const float n = float(offset);
+  const float normalizedCutoff = saturate(cutoffHz / NYQUIST);
+  const float windowIndex = float(offset) + half;
+  const float window = 0.54f - 0.46f * cos(TAU * windowIndex / float(taps - 1));
+  const float sinc = abs(n) < 1e-4f
+      ? normalizedCutoff
+      : sin(PI * normalizedCutoff * n) / (PI * n);
+  return sinc * window;
+}
+
+float lumaCutoffHz() {
+  return max(cb.lumaBW, 0.25f) * 1e6f;
+}
+
+float colorCutoffHz() {
+  return max(cb.colorBW, 1.0f) * 1e3f;
+}
+
+float3 applyVhsTapePath(float2 uv) {
+  const float dx = 1.0f / ACTIVE_SAMPLES;
+  float sumY = 0.0f;
+  float sumI = 0.0f;
+  float sumQ = 0.0f;
+  float normY = 0.0f;
+  float normC = 0.0f;
+
+  // Rust uses a 61-tap FIR for both the luma and color-under paths.
+  [loop]
+  for (int k = -30; k <= 30; ++k) {
+    const float2 sampleUv = float2(uv.x + float(k) * dx, uv.y);
+    const float3 yiq = toYIQ(sampleDisplayColor(sampleUv));
+    const float yWeight = lowpassWeight(k, lumaCutoffHz(), 61);
+    const float cWeight = lowpassWeight(k, colorCutoffHz(), 61);
+    sumY += yiq.x * yWeight;
+    sumI += yiq.y * cWeight;
+    sumQ += yiq.z * cWeight;
+    normY += yWeight;
+    normC += cWeight;
+  }
+
+  float y = sumY / max(normY, 1e-4f);
+  const float i = sumI / max(normC, 1e-4f);
+  const float q = sumQ / max(normC, 1e-4f);
+
+  // Edge ringing is luma-only and follows the VHS bandwidth reduction.
+  // The source-side 31-tap approximation avoids recursively filtering the
+  // 61-tap result for every pixel while retaining the same 1.5 MHz cutoff.
+  float lowpassY = 0.0f;
+  float normRing = 0.0f;
+  [loop]
+  for (int k = -15; k <= 15; ++k) {
+    const float weight = lowpassWeight(k, 1.5e6f, 31);
+    lowpassY += sampleDisplayLuma(float2(uv.x + float(k) * dx, uv.y)) * weight;
+    normRing += weight;
+  }
+  lowpassY /= max(normRing, 1e-4f);
+  y += cb.ringing * (y - lowpassY);
+
+  return toRGB(float3(y, i, q));
+}
+
+float headSmearEnvelope(float line, float frame) {
+  const float phase1 = hash(float2(frame + 11.0f, 17.0f)) * TAU;
+  const float phase2 = hash(float2(frame + 23.0f, 29.0f)) * TAU;
+  const float phase3 = hash(float2(frame + 37.0f, 41.0f)) * TAU;
+  const float envelope =
+      0.5f * sin(TAU * line / 73.0f + phase1) +
+      0.3f * sin(TAU * line / 127.0f + phase2) +
+      0.2f * sin(TAU * line / 41.0f + phase3);
+  return clamp(envelope, 0.0f, 1.0f);
+}
+
+float gaussianNoiseSample(float sample, float line, float field) {
+  const float u1 = max(hash3(float3(sample, line, field)), 1e-5f);
+  const float u2 = hash3(float3(sample + 31.0f, line + 17.0f, field + 7.0f));
+  return sqrt(-2.0f * log(u1)) * cos(TAU * u2);
+}
+
+// Rust generates Gaussian noise per signal sample, then filters it with a
+// 31-tap 3 MHz lowpass.  Keeping the filter in the scanline direction gives
+// tape grain rather than independent RGB/pixel snow.
+float bandLimitedNoise(float sample, float line, float field) {
+  float result = 0.0f;
+  float variance = 0.0f;
+  [loop]
+  for (int k = -15; k <= 15; ++k) {
+    const float weight = lowpassWeight(k, 3.0e6f, 31);
+    result += weight * gaussianNoiseSample(floor(sample) + float(k), line, field);
+    variance += weight * weight;
+  }
+  return result / sqrt(max(variance, 1e-5f));
+}
+
+float3 applyTapeStages(float2 uv) {
+  const float dx = 1.0f / ACTIVE_SAMPLES;
+  const float line = floor(uv.y * 480.0f);
+  const float frame = frameNumber();
+  const float field = fieldNumber();
+
+  float3 c = sampleColor(uv); // pass 0 is sRGB/YIQ; later stages stay there
+  const float3 chroma = c - dot(c, LUMA);
+  float y = dot(c, LUMA);
+
+  // Worn-head smear is a variable-width symmetric box blur on luma only.
+  const int maxRadius = (int)ceil(saturate(cb.headSmear) * 32.0f * ACTIVE_SAMPLES / 754.0f);
+  const int radius = (int)round(headSmearEnvelope(line, frame) * float(maxRadius));
+  if (radius > 0) {
+    float sum = 0.0f;
+    float count = 0.0f;
+    [loop]
+    for (int k = -32; k <= 32; ++k) {
+      if (abs(k) <= radius) {
+        sum += sampleLuma(float2(uv.x + float(k) * dx, uv.y));
+        count += 1.0f;
+      }
+    }
+    y = sum / max(count, 1.0f);
+  }
+  c = float3(y, y, y) + chroma;
+
+  // Rust's tape noise is darker-scene weighted and horizontally band-limited.
+  const float lumaLevel = saturate(y);
+  const float sample = uv.x * ACTIVE_SAMPLES;
+  y += cb.lumaNoise * (1.0f - 0.7f * lumaLevel)
+     * bandLimitedNoise(sample, line, field);
+  return float3(y, y, y) + chroma;
+}
+
+float dropoutLengthSamples(float line, float frame) {
+  const float u = max(hash(float2(line + 71.0f, frame + 73.0f)), 1e-4f);
+  // 4x-fsc sample units, matching Rust's sample_rate * microseconds.
+  return max(4.0f, -log(u) * cb.dropoutLengthUs * 14.31818f);
+}
+
+bool isDropout(float line, float frame, out float start, out float length) {
+  const float rate = max(cb.dropoutRate, 0.0f);
+  const float event = hash(float2(line + 47.0f, frame + 53.0f));
+  start = hash(float2(line + 59.0f, frame + 61.0f)) * ACTIVE_SAMPLES;
+  length = dropoutLengthSamples(line, frame);
+  return rate > 0.0f && event < min(rate / 480.0f, 1.0f);
+}
+
+float3 applyTapeDropout(float2 uv) {
+  const float line = floor(uv.y * 480.0f);
+  const float frame = frameNumber();
+  float start = 0.0f;
+  float length = 0.0f;
+  const float x = uv.x * ACTIVE_SAMPLES;
+  if (!isDropout(line, frame, start, length) || x < start || x >= start + length) {
+    return sampleColor(uv);
+  }
+
+  if (length < 20.0f) {
+    // Rust's short dropout is a neutral composite white spike, not colored
+    // noise. Keep the value in display space until the final conversion.
+    const float spike = 0.6857f + 0.4f + hash(float2(line + 67.0f, frame + 79.0f)) * 0.25f;
+    return float3(spike, spike, spike);
+  }
+
+  // Dropout compensation happens after smear/noise, so it copies the
+  // completed previous-line result just like the Rust in-place signal path.
+  const float previousY = max(uv.y - 1.0f / 480.0f, 0.0f);
+  return sampleColor(float2(uv.x, previousY));
+}
+
+float3 applyTapeTrail(float2 uv) {
+  const float dx = 1.0f / ACTIVE_SAMPLES;
+  const float alpha = 1.0f - saturate(cb.tapeTrail) * 0.70f;
+  const float decay = 1.0f - alpha;
+  float trailY = 0.0f;
+  float weight = alpha;
+
+  // Finite form of y[n] = alpha*x[n] + (1-alpha)*y[n-1].
+  [unroll]
+  for (int k = 0; k <= 32; ++k) {
+    trailY += weight * sampleLuma(float2(uv.x - float(k) * dx, uv.y));
+    weight *= decay;
+  }
+
+  const float3 c = sampleColor(uv);
+  const float3 chroma = c - dot(c, LUMA);
+  return float3(trailY, trailY, trailY) + chroma;
+}
 
 [shader("compute")]
 [numthreads(NTSC_VHS_TILE_SIZE, NTSC_VHS_TILE_SIZE, 1)]
-void main(uint2 pixelPos : SV_DispatchThreadID)
-{
-  if (any(pixelPos >= cb.imageSize))
-    return;
-
-  float2 uv = (float2(pixelPos) + 0.5f) * cb.invImageSize;
-  const float du = 1.0f / NW, dv = 1.0f / NH;
-  float ln = floor(uv.y * NH);
-  float vy = uv.y, cx = uv.x;
-  float field = floor(cb.time * 59.94f);   // NTSC field clock; ALL effects tick on this
-  float bb = 1.0f - uv.y;
-  float hsw = smoothstep(0.03f, 0.0f, bb);
-
-  // ===================== PASS 0: ENCODE (no blur) =====================
-  if (cb.pass == 0u)
-  {
-    cx += hsw * (hash(float2(ln, field)) - 0.5f) * 0.02f;   // head-switch skew
-
-    // subcarrier: lower density (wider rainbow) + band positions re-randomized every
-    // ~30 NTSC fields (interval jittered 20..40 fields), per Kim.
-    float blkLen    = 30.0f + (hash(float2(floor(field / 30.0f), 5.0f)) - 0.5f) * 20.0f;
-    float bandPhase = hash(float2(floor(field / blkLen), 3.0f)) * 6.2831853f;
-    const float fsc = 0.5f;   // subcarrier density (lower = wider rainbow bands)
-
-    // wider luma window notches the subcarrier out of luma -> less dot-crawl crosshatch
-    float lumaHalf   = lerp(10.0f, 5.0f, clamp((cb.lumaBW - 1.0f) / 3.0f, 0.0f, 1.0f));
-    float chromaHalf = lerp(7.0f, 24.0f, clamp((500.0f - cb.colorBW) / 200.0f, 0.0f, 1.0f));
-    float sumY = 0.0f, sumI = 0.0f, sumQ = 0.0f, nY = 0.0f, nC = 0.0f;
-    [unroll]
-    for (int k = -24; k <= 24; ++k)
-    {
-      float fk = float(k);
-      float3 y = toYIQ(tex(float2(cx + fk * du, vy)));
-      float  sx = cx * NW + fk;
-      float  p  = PI * 0.5f * fsc * sx + ln * PI + bandPhase;
-      float  comp = y.x + y.y * cos(p) + y.z * sin(p);
-      float  wY = max(0.0f, 1.0f - abs(fk) / lumaHalf);
-      float  wC = max(0.0f, 1.0f - abs(fk) / chromaHalf);
-      sumY += comp * wY; nY += wY;
-      sumI += comp * cos(p) * wC; sumQ += comp * sin(p) * wC; nC += wC;
-    }
-    float Y = sumY / nY, I = 1.6f * sumI / nC, Q = 1.6f * sumQ / nC;   // calmer rainbow amplitude
-
-    // edge ringing (unsharp) using sharp source luma
-    float Yc = dot(tex(float2(cx, vy)), LUMA);
-    Y = Y + cb.ringing * (Yc - Y) * 2.0f;
-
-    // fine PER-PIXEL tape noise injected into the signal (pass 1 blurs it into
-    // organic grain). Per-pixel (not the NTSC cell grid) avoids the moire crosshatch.
-    float n = (hash3(float3(float(pixelPos.x), float(pixelPos.y), field)) - 0.5f) * cb.lumaNoise;
-    Y += n * (1.0f - 0.6f * Y);
-
-    OutColorTexture[pixelPos] = float4(saturate(toRGB(float3(Y, I, Q))), 1.0f);
+void main(uint2 pixelPos : SV_DispatchThreadID) {
+  if (any(pixelPos >= cb.imageSize)) {
     return;
   }
 
-  // ===================== PASS 1: BLUR (on top of the signal) =====================
-  float3 c = tex(uv);
-
-  // (a) WIDE vertical blur: rainbow bands are horizontal stripes (vary line-to-line),
-  //     so a wide vertical blur is what pushes them "underneath the blur" (per Kim).
-  float3 vb = float3(0.0f, 0.0f, 0.0f);
-  [unroll]
-  for (int j = -3; j <= 3; ++j) vb += tex(float2(cx, vy + float(j) * dv));
-  vb /= 7.0f;
-  c = lerp(c, vb, 0.6f + cb.vertSoften * 0.4f);
-
-  // (b) head-switching smear: horizontal box blur (banded) + a base horizontal softness
-  float band = (sin(vy * 180.0f) + sin(vy * 260.0f) + sin(vy * 100.0f)) / 3.0f * 0.5f + 0.5f;
-  float rr = (cb.headSmear * (0.4f + band) + 0.5f) * 4.0f * du;
-  float3 sm = float3(0.0f, 0.0f, 0.0f);
-  [unroll]
-  for (int b = -5; b <= 5; ++b) sm += tex(float2(cx + float(b) * rr, vy));
-  sm /= 11.0f;
-  c = lerp(c, sm, 0.5f + cb.headSmear * 0.5f);
-
-  // (c) tape trail: rightward one-pole IIR comet tail (RGB)
-  float a = 0.85f - cb.tapeTrail * 0.70f;
-  float3 tr = float3(0.0f, 0.0f, 0.0f); float ww = a, dec = 1.0f - a;
-  [unroll]
-  for (int t = 0; t <= 20; ++t) { tr += ww * tex(float2(cx - float(t) * du, vy)); ww *= dec; }
-  c = lerp(c, tr, 0.85f);
-
-  // (d) ghosting: SMOOTH decaying smear across the offset (not a hard double image)
-  float3 gsum = float3(0.0f, 0.0f, 0.0f); float gw = 0.0f;
-  [unroll]
-  for (int gi = 1; gi <= 6; ++gi) { float w = 1.0f - float(gi) / 7.0f; gsum += tex(float2(cx - 0.028f * float(gi) / 6.0f, vy)) * w; gw += w; }
-  c += (gsum / gw) * cb.ghost;
-
-  // (e) dropout: rare, short, not stark white
-  float dl = hash(float2(ln * 2.3f, field));
-  if (dl > 0.997f)
-  {
-    float xs = hash(float2(ln, field + 5.0f));
-    if (abs(uv.x - xs) < 0.05f) c = lerp(c, float3(0.85f, 0.85f, 0.80f), 0.5f);
+  const float2 uv = (float2(pixelPos) + 0.5f) * cb.invImageSize;
+  if (cb.pass == 0u) {
+    OutColorTexture[pixelPos] = float4(applyVhsTapePath(uv), 1.0f);
+  } else if (cb.pass == 1u) {
+    OutColorTexture[pixelPos] = float4(applyTapeStages(uv), 1.0f);
+  } else if (cb.pass == 2u) {
+    OutColorTexture[pixelPos] = float4(applyTapeDropout(uv), 1.0f);
+  } else {
+    const float3 display = saturate(applyTapeTrail(uv));
+    OutColorTexture[pixelPos] = float4(srgbToLinear(display), 1.0f);
   }
-  // (f) head-switch noise band at the very bottom
-  c = lerp(c, float3(hash3(float3(cx * NW, ln, field))), hsw * 0.5f);
-  // (g) mild vignette
-  c *= 1.0f - 0.18f * pow(length(uv - 0.5f) * 1.2f, 2.2f);
-
-  OutColorTexture[pixelPos] = float4(saturate(c), 1.0f);
 }

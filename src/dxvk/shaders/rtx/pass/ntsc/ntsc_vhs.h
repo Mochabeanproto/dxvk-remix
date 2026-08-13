@@ -1,12 +1,11 @@
 /*
  * NTSC/VHS composite post-process - shared shader/C++ header.
- * Matches the fork's post_fx.h convention (uint2/float2 resolve on both sides).
- * Place at: src/dxvk/shaders/rtx/pass/ntsc/ntsc_vhs.h
+ * The fields intentionally mirror the Rust simulator's tape-path controls.
  */
 #pragma once
 
-#define NTSC_VHS_INPUT   0   // Sampler2D  : composited LDR color (read)
-#define NTSC_VHS_OUTPUT  1   // RWTexture2D: processed output (write)
+#define NTSC_VHS_INPUT   0   // Sampler2D  : post-tonemap linear/sRGB color (read)
+#define NTSC_VHS_OUTPUT  1   // RWTexture2D: processed color (write)
 
 #define NTSC_VHS_TILE_SIZE 8
 
@@ -14,18 +13,18 @@ struct NtscVhsArgs {
   uint2  imageSize;
   float2 invImageSize;
 
-  float  time;        // seconds (animated noise/dropout)
-  float  lumaBW;      // MHz  (SP~3.0, EP/SLP~1.6)
-  float  colorBW;     // kHz  (300..500; lower = heavier chroma smudge)
-  float  ringing;     // edge peaking gain
+  float  time;              // seconds
+  float  lumaBW;            // MHz (VHS tape luma bandwidth)
+  float  colorBW;           // kHz (VHS color-under bandwidth)
+  float  ringing;           // playback peaking gain
 
-  float  ghost;       // multipath ghost mix
-  float  tapeTrail;   // 0..1 -> IIR alpha 0.85..0.15 (rightward comet tail)
-  float  headSmear;   // banded symmetric luma blur
-  float  lumaNoise;   // luminance-dependent grain
+  float  lumaNoise;         // luminance-dependent tape noise amplitude
+  float  dropoutRate;       // average dropouts per 480-line frame
+  float  dropoutLengthUs;   // average dropout length in microseconds
+  float  headSmear;         // worn-head symmetric luma smear strength
 
-  float  vertSoften;  // capture-realism extra (0 = strict Kim match)
-  uint   frameIdx;    // for noise animation if time is unavailable
-  uint   pass;        // 0 = encode (decode+rainbow+noise), 1 = blur (over the signal)
+  float  tapeTrail;         // causal luma IIR strength, 0..1
+  uint   frameIdx;           // fallback/deterministic animation seed
+  uint   pass;               // 0 = VHS path, 1 = smear/noise, 2 = dropout, 3 = trail/output
   float  _pad1;
 };

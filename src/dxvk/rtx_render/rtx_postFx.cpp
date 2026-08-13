@@ -405,34 +405,57 @@ namespace dxvk {
     const VkExtent3D workgroups = util::computeBlockCount(inputSize, VkExtent3D { NTSC_VHS_TILE_SIZE, NTSC_VHS_TILE_SIZE, 1 });
 
     NtscVhsArgs args = {};
-    args.imageSize    = { (uint)inputSize.width, (uint)inputSize.height };
-    args.invImageSize = { 1.0f / (float)inputSize.width, 1.0f / (float)inputSize.height };
-    args.time         = (float)(GlobalTime::get().absoluteTimeMs()) / 1000.0f;   // real seconds
-    args.lumaBW       = ntscLumaBW();
-    args.colorBW      = ntscColorBW();
-    args.ringing      = ntscRinging();
-    args.ghost        = ntscGhost();
-    args.tapeTrail    = ntscTapeTrail();
-    args.headSmear    = ntscHeadSmear();
-    args.lumaNoise    = ntscLumaNoise();
-    args.vertSoften   = ntscVertSoften();
-    args.frameIdx     = frameIdx;
+    args.imageSize       = { (uint)inputSize.width, (uint)inputSize.height };
+    args.invImageSize    = { 1.0f / (float)inputSize.width, 1.0f / (float)inputSize.height };
+    args.time            = (float)(GlobalTime::get().absoluteTimeMs()) / 1000.0f;   // real seconds
+    args.lumaBW          = ntscLumaBW();
+    args.colorBW         = ntscColorBW();
+    args.ringing         = ntscRinging();
+    args.lumaNoise       = ntscLumaNoise();
+    args.dropoutRate     = ntscDropoutRate();
+    args.dropoutLengthUs = ntscDropoutLengthUs();
+    args.headSmear       = ntscHeadSmear();
+    args.tapeTrail       = ntscTapeTrail();
+    args.frameIdx        = frameIdx;
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
-    // Pass 0 (encode): final -> intermediate. Builds the signal with rainbow + noise.
+    // Kim's Rust-aligned 4-pass chain, ping-ponging final <-> intermediate:
+    //   pass 0 VHS path    : final        -> intermediate
+    //   pass 1 smear/noise : intermediate -> final
+    //   pass 2 dropout     : final        -> intermediate
+    //   pass 3 trail/output: intermediate -> final  (converts back to linear)
+    const Resources::Resource& inter = rtOutput.m_postFxIntermediateTexture;
+
     args.pass = 0;
     ctx->pushConstants(0, sizeof(args), &args);
     ctx->bindResourceView(NTSC_VHS_INPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Read), nullptr);
     ctx->bindResourceSampler(NTSC_VHS_INPUT, linearSampler);
-    ctx->bindResourceView(NTSC_VHS_OUTPUT, rtOutput.m_postFxIntermediateTexture.view, nullptr);
+    ctx->bindResourceView(NTSC_VHS_OUTPUT, inter.view, nullptr);
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NtscVhsShader::getShader());
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 
-    // Pass 1 (blur): intermediate -> final. Blur lands on top of noise + rainbow.
     args.pass = 1;
     ctx->pushConstants(0, sizeof(args), &args);
-    ctx->bindResourceView(NTSC_VHS_INPUT, rtOutput.m_postFxIntermediateTexture.view, nullptr);
+    ctx->bindResourceView(NTSC_VHS_INPUT, inter.view, nullptr);
+    ctx->bindResourceSampler(NTSC_VHS_INPUT, linearSampler);
+    ctx->bindResourceView(NTSC_VHS_OUTPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Write), nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NtscVhsShader::getShader());
+    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+
+    args.pass = 2;
+    ctx->pushConstants(0, sizeof(args), &args);
+    ctx->bindResourceView(NTSC_VHS_INPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Read), nullptr);
+    ctx->bindResourceSampler(NTSC_VHS_INPUT, linearSampler);
+    ctx->bindResourceView(NTSC_VHS_OUTPUT, inter.view, nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NtscVhsShader::getShader());
+    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+
+    // Pass 3: tape trail (luma-only) reads the intermediate and writes the
+    // final image, converting display-space RGB back to linear output.
+    args.pass = 3;
+    ctx->pushConstants(0, sizeof(args), &args);
+    ctx->bindResourceView(NTSC_VHS_INPUT, inter.view, nullptr);
     ctx->bindResourceSampler(NTSC_VHS_INPUT, linearSampler);
     ctx->bindResourceView(NTSC_VHS_OUTPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Write), nullptr);
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NtscVhsShader::getShader());

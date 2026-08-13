@@ -101,14 +101,14 @@ namespace dxvk {
                     "Enable the NTSC/VHS composite look.",
                     args.environment = "RTX_NTSC_ENABLE",
                     args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION("rtx.ntsc", float, ntscLumaBW,     2.80f,  "Luma bandwidth MHz (SP~3.0, EP~1.6).");
-    RTX_OPTION("rtx.ntsc", float, ntscColorBW,  420.00f,  "Color-under chroma bandwidth kHz (300..500).");
-    RTX_OPTION("rtx.ntsc", float, ntscRinging,    0.30f,  "Edge ringing / playback peaking.");
-    RTX_OPTION("rtx.ntsc", float, ntscGhost,      0.10f,  "Multipath ghost mix.");
-    RTX_OPTION("rtx.ntsc", float, ntscTapeTrail,  0.66f,  "Tape trail comet tail (rightward IIR), 0..1.");
-    RTX_OPTION("rtx.ntsc", float, ntscHeadSmear,  0.22f,  "Head-switching banded luma blur.");
-    RTX_OPTION("rtx.ntsc", float, ntscLumaNoise,  0.012f, "Luminance-dependent grain.");
-    RTX_OPTION("rtx.ntsc", float, ntscVertSoften, 0.40f,  "Vertical softening.");
+    RTX_OPTION("rtx.ntsc", float, ntscLumaBW,          3.00f,  "VHS luma bandwidth MHz (SP~3.0, EP~1.6).");
+    RTX_OPTION("rtx.ntsc", float, ntscColorBW,       425.00f,  "Color-under chroma bandwidth kHz (300..500).");
+    RTX_OPTION("rtx.ntsc", float, ntscRinging,         0.30f,  "Playback peaking / edge ringing gain.");
+    RTX_OPTION("rtx.ntsc", float, ntscLumaNoise,       0.03f,  "Luminance-dependent tape noise amplitude.");
+    RTX_OPTION("rtx.ntsc", float, ntscDropoutRate,     0.50f,  "Average tape dropouts per 480-line frame.");
+    RTX_OPTION("rtx.ntsc", float, ntscDropoutLengthUs, 2.00f,  "Average dropout length (microseconds).");
+    RTX_OPTION("rtx.ntsc", float, ntscHeadSmear,       0.18f,  "Worn-head symmetric luma smear strength.");
+    RTX_OPTION("rtx.ntsc", float, ntscTapeTrail,       0.68f,  "Causal luma tape trail (0..1).");
 
   private:
     Rc<vk::DeviceFn> m_vkd;
