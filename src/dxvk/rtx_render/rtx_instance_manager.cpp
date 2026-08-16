@@ -1291,6 +1291,44 @@ namespace dxvk {
             tmpMaterialData.getOpaqueMaterialData().setEmissiveColorTexture(tmpMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture());
           }
 
+          // Mapless thin-opaque subsurface override. UV rectangles are carried
+          // with the material extension and evaluated per hit in the shader, so
+          // atlas regions outside the mask remain ordinary opaque material.
+          const XXH64_hash_t textureHash = drawCall.getMaterialData().getColorTexture().getImageHash();
+          if (RtxOptions::subsurfaceOverrideTextures().find(textureHash) != RtxOptions::subsurfaceOverrideTextures().end()) {
+            if (materialData != &tmpMaterialData) {
+              tmpMaterialData = *materialData;
+              materialData = &tmpMaterialData;
+            }
+
+            auto& subsurfaceMaterialData = tmpMaterialData.getOpaqueMaterialData();
+            float measurementDistance = 1.0f;
+            const auto thicknesses = RtxOptions::parseThinWallThicknessOverrides(RtxOptions::subsurfaceOverrideThicknessString());
+            if (const auto thickness = thicknesses.find(textureHash); thickness != thicknesses.end()) {
+              measurementDistance = thickness->second;
+            }
+            subsurfaceMaterialData.setSubsurfaceMeasurementDistance(measurementDistance);
+            subsurfaceMaterialData.setSubsurfaceTransmittanceTexture(subsurfaceMaterialData.getAlbedoOpacityTexture());
+
+            const auto masks = RtxOptions::parseSubsurfaceUvMasks(RtxOptions::subsurfaceOverrideUvRectsString());
+            const RasterGeometry& geometry = drawCall.getGeometryData();
+            const XXH64_hash_t meshHash = geometry.externalMesh != nullptr
+              ? reinterpret_cast<XXH64_hash_t>(geometry.externalMesh)
+              : drawCall.getHash(RtxOptions::geometryAssetHashRule());
+            if (const auto mask = masks.find(textureHash);
+                mask != masks.end() && mask->second.meshHash == meshHash) {
+              subsurfaceMaterialData.setSubsurfaceUvMaskEnabled(true);
+              subsurfaceMaterialData.setSubsurfaceUvMaskRectCount(static_cast<uint8_t>(mask->second.count));
+              const auto asMaterialRange = [](const Vector2& range) {
+                return Vector4(range.x, range.y, 0.0f, 0.0f);
+              };
+              subsurfaceMaterialData.setSubsurfaceUvMaskRect0(asMaterialRange(mask->second.primitiveRanges[0]));
+              subsurfaceMaterialData.setSubsurfaceUvMaskRect1(asMaterialRange(mask->second.primitiveRanges[1]));
+              subsurfaceMaterialData.setSubsurfaceUvMaskRect2(asMaterialRange(mask->second.primitiveRanges[2]));
+              subsurfaceMaterialData.setSubsurfaceUvMaskRect3(asMaterialRange(mask->second.primitiveRanges[3]));
+            }
+          }
+
           currentInstance.m_isSubsurface = materialData->getOpaqueMaterialData().getSubsurfaceDiffusionProfile();
         } else if (materialData->getType() == MaterialDataType::Translucent) {
           // Per-texture Thin-Walled override, set via the in-game Texture Selection

@@ -21,6 +21,7 @@
 */
 #pragma once
 
+#include <array>
 #include <memory>
 #include <variant>
 
@@ -1346,7 +1347,10 @@ struct RtSubsurfaceMaterial {
     const Vector3& subsurfaceSingleScatteringAlbedo,
     const float subsurfaceVolumetricAnisotropy,
     const float subsurfaceRadiusScale,
-    const float subsurfaceMaxSampleRadius)
+    const float subsurfaceMaxSampleRadius,
+    const bool subsurfaceUvMaskEnabled,
+    const uint8_t subsurfaceUvMaskRectCount,
+    const std::array<Vector4, 4>& subsurfaceUvMaskRects)
     :
     m_subsurfaceTransmittanceTextureIndex(subsurfaceTransmittanceTextureIndex),
     m_subsurfaceThicknessTextureIndex(subsurfaceThicknessTextureIndex),
@@ -1361,7 +1365,10 @@ struct RtSubsurfaceMaterial {
               -log(std::max(subsurfaceTransmittanceColor.y, FLT_EPSILON)),
               -log(std::max(subsurfaceTransmittanceColor.z, FLT_EPSILON))) / std::max(subsurfaceMeasurementDistance, FLT_EPSILON) },
     m_subsurfaceRadiusScale { subsurfaceRadiusScale },
-    m_subsurfaceMaxSampleRadius { subsurfaceMaxSampleRadius }
+    m_subsurfaceMaxSampleRadius { subsurfaceMaxSampleRadius },
+    m_subsurfaceUvMaskEnabled { subsurfaceUvMaskEnabled },
+    m_subsurfaceUvMaskRectCount { subsurfaceUvMaskRectCount },
+    m_subsurfaceUvMaskRects { subsurfaceUvMaskRects }
   {
     updateCachedHash();
   }
@@ -1373,7 +1380,7 @@ struct RtSubsurfaceMaterial {
     // this data is accessed from uint16_t data[32], so data[n] refers to a pair of bytes.
 
     // Write an empty flags to stay consistent with the other materials.
-    uint16_t flags = 0;
+    uint16_t flags = m_subsurfaceUvMaskEnabled ? 1u : 0u;
 
     // data[0]
     writeGPUHelperExplicit<2>(data, offset, flags);
@@ -1415,8 +1422,18 @@ struct RtSubsurfaceMaterial {
     // data[12]
     writeGPUHelper(data, offset, glm::packHalf1x16(m_subsurfaceMaxSampleRadius));
 
-    // data[13-31]
-    writeGPUPadding<38>(data, offset);
+    // data[13]
+    const uint16_t uvMaskRectCount = m_subsurfaceUvMaskRectCount;
+    writeGPUHelperExplicit<2>(data, offset, uvMaskRectCount);
+
+    // data[14-29]: four inclusive primitive-index ranges.
+    for (const Vector4& rect : m_subsurfaceUvMaskRects) {
+      writeGPUHelperExplicit<4>(data, offset, static_cast<uint32_t>(rect.x));
+      writeGPUHelperExplicit<4>(data, offset, static_cast<uint32_t>(rect.y));
+    }
+
+    // data[30-31]
+    writeGPUPadding<4>(data, offset);
   }
 
   bool operator==(const RtSubsurfaceMaterial& r) const {
@@ -1478,7 +1495,7 @@ private:
 
   void updateCachedHash() {
     static_assert(
-      sizeof(*this) == 72,
+      sizeof(*this) == 144,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -1492,6 +1509,9 @@ private:
       Vector3 m_subsurfaceVolumetricAttenuationCoefficient;
       float m_subsurfaceRadiusScale;
       float m_subsurfaceMaxSampleRadius;
+      uint32_t m_subsurfaceUvMaskEnabled;
+      uint32_t m_subsurfaceUvMaskRectCount;
+      Vector4 m_subsurfaceUvMaskRects[4];
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -1506,6 +1526,12 @@ private:
       m_subsurfaceVolumetricAttenuationCoefficient,
       m_subsurfaceRadiusScale,
       m_subsurfaceMaxSampleRadius,
+      m_subsurfaceUvMaskEnabled ? 1u : 0u,
+      m_subsurfaceUvMaskRectCount,
+      {
+        m_subsurfaceUvMaskRects[0], m_subsurfaceUvMaskRects[1],
+        m_subsurfaceUvMaskRects[2], m_subsurfaceUvMaskRects[3]
+      },
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -1528,6 +1554,9 @@ private:
   // SSS properties using Diffusion Profile
   float m_subsurfaceRadiusScale;
   float m_subsurfaceMaxSampleRadius;
+  bool m_subsurfaceUvMaskEnabled;
+  uint8_t m_subsurfaceUvMaskRectCount;
+  std::array<Vector4, 4> m_subsurfaceUvMaskRects;
 
   XXH64_hash_t m_cachedHash;
 };

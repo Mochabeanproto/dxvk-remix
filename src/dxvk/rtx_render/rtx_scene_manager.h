@@ -251,6 +251,15 @@ public:
 
   std::optional<XXH64_hash_t> findLegacyTextureHashByObjectPickingValue(uint32_t objectPickingValue);
   std::optional<XXH64_hash_t> findMeshHashByObjectPickingValue(uint32_t objectPickingValue);
+  struct UvTopologyTriangle {
+    std::array<Vector2, 3> uv {};
+    std::array<uint32_t, 3> vertexIndices {};
+    uint32_t primitiveIndex = 0;
+  };
+  struct UvTopology {
+    std::vector<UvTopologyTriangle> triangles {};
+  };
+  std::shared_ptr<const UvTopology> findUvTopologyByObjectPickingValue(uint32_t objectPickingValue);
   void logMeshHashByObjectPickingValue(uint32_t objectPickingValue);
   std::vector<ObjectPickingValue> gatherObjectPickingValuesByTextureHash(XXH64_hash_t texHash);
 
@@ -491,6 +500,7 @@ private:
     XXH64_hash_t legacyTextureHash { kEmptyHash };
     XXH64_hash_t legacyTextureHash2 { kEmptyHash };
     XXH64_hash_t meshHash { kEmptyHash };
+    std::shared_ptr<const UvTopology> uvTopology {};
     std::shared_ptr<DrawCallInstrumentation> instrumentation {};
   };
 

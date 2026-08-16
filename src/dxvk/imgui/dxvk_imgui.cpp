@@ -207,7 +207,8 @@ namespace dxvk {
     {"raytracedRenderTargetTextures","Raytraced Render Target Textures (optional)", &RtxOptions::raytracedRenderTargetTexturesObject(), ImGUI::kTextureFlagsRenderTarget},
     {"particleemittertextures","Particle Emitters (optional)", &RtxOptions::particleEmitterTexturesObject()},
     {"smoothnormalstextures","Smooth Normals (optional)", &RtxOptions::smoothNormalsTexturesObject()},
-    {"thinwalledtranslucenttextures","Thin-Walled Translucent (optional)", &RtxOptions::thinWalledOverrideTexturesObject()}
+    {"thinwalledtranslucenttextures","Thin-Walled Translucent (optional)", &RtxOptions::thinWalledOverrideTexturesObject()},
+    {"subsurfaceoverridetextures", "Subsurface / Thin Material", &RtxOptions::subsurfaceOverrideTexturesObject()}
   };
 
   RemixGui::ComboWithKey<RenderPassGBufferRaytraceMode> renderPassGBufferRaytraceModeCombo {
@@ -2166,6 +2167,7 @@ namespace dxvk {
       // as 'open()' is called only once, but the popup needs them throughout open-close
       std::atomic<XXH64_hash_t> g_holdingTexture {};
       std::atomic<XXH64_hash_t> g_holdingMeshHash {};
+      std::shared_ptr<const SceneManager::UvTopology> g_holdingUvTopology {};
       bool g_openWhenAvailable {};
 
       void openImguiPopupOrToggle() {
@@ -2191,6 +2193,7 @@ namespace dxvk {
       void open(std::optional<XXH64_hash_t> texHash) {
         g_holdingTexture.exchange(texHash.value_or(kEmptyHash));
         g_holdingMeshHash.exchange(kEmptyHash);
+        g_holdingUvTopology.reset();
         g_openWhenAvailable = false;
         // no need to wait, open immediately
         openImguiPopupOrToggle();
@@ -2199,6 +2202,7 @@ namespace dxvk {
       void openAsync() {
         g_holdingTexture.exchange(kEmptyHash);
         g_holdingMeshHash.exchange(kEmptyHash);
+        g_holdingUvTopology.reset();
         g_openWhenAvailable = true;
       }
 
@@ -2425,6 +2429,310 @@ namespace dxvk {
 
                 ImGui::Unindent();
               }
+
+              if (strcmp(rtxOption.uniqueId, "subsurfaceoverridetextures") == 0 && rtxOption.bufferToggle) {
+                ImGui::Indent();
+
+                auto thicknesses = RtxOptions::parseThinWallThicknessOverrides(RtxOptions::subsurfaceOverrideThicknessString());
+                float measurementDistance = 1.0f;
+                if (const auto thickness = thicknesses.find(texHash); thickness != thicknesses.end()) {
+                  measurementDistance = thickness->second;
+                }
+                ImGui::Text("Transmission Distance:");
+                ImGui::PushItemWidth(150.0f);
+                if (ImGui::DragFloat("##subsurface_measurement_distance_islands", &measurementDistance, 0.01f, 0.001f, 65504.0f, "%.3f")) {
+                  thicknesses[texHash] = measurementDistance;
+                  RtxOptions::subsurfaceOverrideThicknessStringObject().setDeferred(
+                    RtxOptions::thinWallThicknessOverridesToString(thicknesses));
+                }
+                ImGui::PopItemWidth();
+
+                auto masks = RtxOptions::parseSubsurfaceUvMasks(RtxOptions::subsurfaceOverrideUvRectsString());
+                const auto existingMask = masks.find(texHash);
+                bool uvMode = meshHash != kEmptyHash && existingMask != masks.end() && existingMask->second.meshHash == meshHash;
+                const bool topologyAvailable = meshHash != kEmptyHash && g_holdingUvTopology != nullptr && !g_holdingUvTopology->triangles.empty();
+                ImGui::BeginDisabled(!topologyAvailable);
+                if (ImGui::Checkbox("Select on UV", &uvMode)) {
+                  if (uvMode) {
+                    RtxOptions::SubsurfaceUvMask selection;
+                    selection.meshHash = meshHash;
+                    masks[texHash] = selection;
+                  } else {
+                    masks.erase(texHash);
+                  }
+                  RtxOptions::subsurfaceOverrideUvRectsStringObject().setDeferred(
+                    RtxOptions::subsurfaceUvMasksToString(masks));
+                }
+                ImGui::EndDisabled();
+
+                if (!topologyAvailable) {
+                  ImGui::TextWrapped("Select this object directly in the world to load its real mesh UV islands. Texture thumbnails alone do not identify a mesh.");
+                } else if (uvMode) {
+                  auto& selection = masks[texHash];
+                  const auto& triangles = g_holdingUvTopology->triangles;
+                  auto textureIt = g_imguiTextureMap.find(texHash);
+                  if (textureIt != g_imguiTextureMap.end()) {
+                    if (textureIt->second.texID == VK_NULL_HANDLE) {
+                      textureIt->second.texID = ImGui_ImplDxvk::AddTexture(nullptr, textureIt->second.imageView);
+                    }
+                    if (textureIt->second.texID != VK_NULL_HANDLE) {
+                      const auto& imageInfo = textureIt->second.imageView->imageInfo();
+                      const float aspect = static_cast<float>(imageInfo.extent.width) / imageInfo.extent.height;
+                      const float editorWidth = std::min(420.0f, ImGui::GetContentRegionAvail().x);
+                      const ImVec2 editorSize(editorWidth, editorWidth / std::max(aspect, 0.001f));
+                      ImGui::TextWrapped("Click an existing UV island. Green triangles are selected; drawing new regions is disabled.");
+                      ImGui::Image(textureIt->second.texID, editorSize);
+                      const ImVec2 imageMin = ImGui::GetItemRectMin();
+                      const ImVec2 imageMax = ImGui::GetItemRectMax();
+                      ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+                      auto uvToScreen = [&](const Vector2& uv) {
+                        return ImVec2(
+                          imageMin.x + uv.x * (imageMax.x - imageMin.x),
+                          imageMin.y + uv.y * (imageMax.y - imageMin.y));
+                      };
+                      auto primitiveSelected = [&](uint32_t primitive) {
+                        for (uint32_t rangeIndex = 0; rangeIndex < selection.count; ++rangeIndex) {
+                          const Vector2& range = selection.primitiveRanges[rangeIndex];
+                          if (primitive >= static_cast<uint32_t>(range.x) && primitive <= static_cast<uint32_t>(range.y)) {
+                            return true;
+                          }
+                        }
+                        return false;
+                      };
+
+                      std::vector<uint32_t> parent(triangles.size());
+                      for (uint32_t i = 0; i < parent.size(); ++i) parent[i] = i;
+                      auto findRoot = [&](uint32_t value) {
+                        while (parent[value] != value) {
+                          parent[value] = parent[parent[value]];
+                          value = parent[value];
+                        }
+                        return value;
+                      };
+                      auto unite = [&](uint32_t a, uint32_t b) {
+                        a = findRoot(a);
+                        b = findRoot(b);
+                        if (a != b) parent[b] = a;
+                      };
+                      std::unordered_map<uint32_t, uint32_t> vertexOwner;
+                      for (uint32_t triangleIndex = 0; triangleIndex < triangles.size(); ++triangleIndex) {
+                        for (uint32_t vertex : triangles[triangleIndex].vertexIndices) {
+                          const auto [owner, inserted] = vertexOwner.emplace(vertex, triangleIndex);
+                          if (!inserted) unite(triangleIndex, owner->second);
+                        }
+                      }
+
+                      static bool islandTooFragmented = false;
+                      if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                        const ImVec2 mouse = ImGui::GetMousePos();
+                        const Vector2 point(
+                          (mouse.x - imageMin.x) / (imageMax.x - imageMin.x),
+                          (mouse.y - imageMin.y) / (imageMax.y - imageMin.y));
+                        auto pointInTriangle = [](const Vector2& p, const std::array<Vector2, 3>& uv) {
+                          const float d1 = (p.x - uv[1].x) * (uv[0].y - uv[1].y) - (uv[0].x - uv[1].x) * (p.y - uv[1].y);
+                          const float d2 = (p.x - uv[2].x) * (uv[1].y - uv[2].y) - (uv[1].x - uv[2].x) * (p.y - uv[2].y);
+                          const float d3 = (p.x - uv[0].x) * (uv[2].y - uv[0].y) - (uv[2].x - uv[0].x) * (p.y - uv[0].y);
+                          const bool hasNegative = d1 < 0.0f || d2 < 0.0f || d3 < 0.0f;
+                          const bool hasPositive = d1 > 0.0f || d2 > 0.0f || d3 > 0.0f;
+                          return !(hasNegative && hasPositive);
+                        };
+                        for (uint32_t clicked = 0; clicked < triangles.size(); ++clicked) {
+                          if (!pointInTriangle(point, triangles[clicked].uv)) continue;
+                          const uint32_t clickedRoot = findRoot(clicked);
+                          std::vector<uint32_t> primitives;
+                          for (uint32_t i = 0; i < triangles.size(); ++i) {
+                            if (findRoot(i) == clickedRoot) primitives.push_back(triangles[i].primitiveIndex);
+                          }
+                          std::sort(primitives.begin(), primitives.end());
+                          RtxOptions::SubsurfaceUvMask candidate;
+                          candidate.meshHash = meshHash;
+                          if (!primitives.empty()) {
+                            uint32_t first = primitives.front();
+                            uint32_t last = first;
+                            for (size_t i = 1; i <= primitives.size(); ++i) {
+                              if (i < primitives.size() && primitives[i] == last + 1) {
+                                last = primitives[i];
+                                continue;
+                              }
+                              if (candidate.count >= RtxOptions::SubsurfaceUvMask::kMaxRanges) {
+                                candidate.count = RtxOptions::SubsurfaceUvMask::kMaxRanges + 1;
+                                break;
+                              }
+                              candidate.primitiveRanges[candidate.count++] = Vector2(static_cast<float>(first), static_cast<float>(last));
+                              if (i < primitives.size()) first = last = primitives[i];
+                            }
+                          }
+                          islandTooFragmented = candidate.count > RtxOptions::SubsurfaceUvMask::kMaxRanges;
+                          if (!islandTooFragmented) {
+                            selection = candidate;
+                            RtxOptions::subsurfaceOverrideUvRectsStringObject().setDeferred(
+                              RtxOptions::subsurfaceUvMasksToString(masks));
+                          }
+                          break;
+                        }
+                      }
+
+                      for (const auto& triangle : triangles) {
+                        const ImVec2 a = uvToScreen(triangle.uv[0]);
+                        const ImVec2 b = uvToScreen(triangle.uv[1]);
+                        const ImVec2 c = uvToScreen(triangle.uv[2]);
+                        if (primitiveSelected(triangle.primitiveIndex)) {
+                          drawList->AddTriangleFilled(a, b, c, IM_COL32(118, 185, 0, 85));
+                        }
+                        drawList->AddTriangle(a, b, c,
+                          primitiveSelected(triangle.primitiveIndex) ? IM_COL32(155, 230, 30, 255) : IM_COL32(255, 180, 30, 180), 1.0f);
+                      }
+                      if (islandTooFragmented) {
+                        ImGui::TextWrapped("This island is split into more primitive ranges than the material can encode; nothing was changed.");
+                      }
+                      ImGui::Text("Selected primitive ranges: %u", selection.count);
+                      ImGui::BeginDisabled(selection.count == 0);
+                      if (ImGui::Button("Clear Island##subsurface_uv_island")) {
+                        selection.count = 0;
+                        RtxOptions::subsurfaceOverrideUvRectsStringObject().setDeferred(
+                          RtxOptions::subsurfaceUvMasksToString(masks));
+                      }
+                      ImGui::EndDisabled();
+                    }
+                  }
+                }
+
+                ImGui::Unindent();
+              }
+
+#if 0 // Replaced by mesh-aware, click-only UV-island selection above.
+              if (strcmp(rtxOption.uniqueId, "subsurfaceoverridetextures") == 0 && rtxOption.bufferToggle) {
+                ImGui::Indent();
+
+                auto thicknesses = RtxOptions::parseThinWallThicknessOverrides(RtxOptions::subsurfaceOverrideThicknessString());
+                float measurementDistance = 1.0f;
+                if (const auto thickness = thicknesses.find(texHash); thickness != thicknesses.end()) {
+                  measurementDistance = thickness->second;
+                }
+                ImGui::Text("Transmission Distance:");
+                ImGui::PushItemWidth(150.0f);
+                if (ImGui::DragFloat("##subsurface_measurement_distance", &measurementDistance, 0.01f, 0.001f, 65504.0f, "%.3f")) {
+                  thicknesses[texHash] = measurementDistance;
+                  RtxOptions::subsurfaceOverrideThicknessStringObject().setDeferred(
+                    RtxOptions::thinWallThicknessOverridesToString(thicknesses));
+                }
+                ImGui::PopItemWidth();
+                if (ImGui::IsItemHovered()) {
+                  ImGui::SetTooltip("Material distance used by thin-opaque subsurface transmission.");
+                }
+
+                auto masks = RtxOptions::parseSubsurfaceUvMasks(RtxOptions::subsurfaceOverrideUvRectsString());
+                bool uvMode = masks.find(texHash) != masks.end();
+                if (ImGui::Checkbox("Select on UV", &uvMode)) {
+                  if (uvMode) {
+                    masks[texHash] = RtxOptions::SubsurfaceUvMask {};
+                  } else {
+                    masks.erase(texHash);
+                  }
+                  RtxOptions::subsurfaceOverrideUvRectsStringObject().setDeferred(
+                    RtxOptions::subsurfaceUvMasksToString(masks));
+                }
+                if (ImGui::IsItemHovered()) {
+                  ImGui::SetTooltip("Off: apply to the whole texture. On: apply only inside rectangles drawn on the UV atlas.");
+                }
+
+                if (uvMode) {
+                  auto& mask = masks[texHash];
+                  auto textureIt = g_imguiTextureMap.find(texHash);
+                  if (textureIt != g_imguiTextureMap.end()) {
+                    if (textureIt->second.texID == VK_NULL_HANDLE) {
+                      textureIt->second.texID = ImGui_ImplDxvk::AddTexture(nullptr, textureIt->second.imageView);
+                    }
+
+                    if (textureIt->second.texID != VK_NULL_HANDLE) {
+                      const auto& imageInfo = textureIt->second.imageView->imageInfo();
+                      const float aspect = static_cast<float>(imageInfo.extent.width) / imageInfo.extent.height;
+                      const float editorWidth = std::min(420.0f, ImGui::GetContentRegionAvail().x);
+                      const ImVec2 editorSize(editorWidth, editorWidth / std::max(aspect, 0.001f));
+
+                      ImGui::TextWrapped("Drag rectangles over the UV islands that should transmit light. Up to four regions can be combined.");
+                      ImGui::Image(textureIt->second.texID, editorSize);
+                      const ImVec2 imageMin = ImGui::GetItemRectMin();
+                      const ImVec2 imageMax = ImGui::GetItemRectMax();
+                      ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+                      auto uvToScreen = [&](const Vector2& uv) {
+                        return ImVec2(
+                          imageMin.x + uv.x * (imageMax.x - imageMin.x),
+                          imageMin.y + uv.y * (imageMax.y - imageMin.y));
+                      };
+                      auto mouseToUv = [&]() {
+                        const ImVec2 mouse = ImGui::GetMousePos();
+                        return Vector2(
+                          std::clamp((mouse.x - imageMin.x) / (imageMax.x - imageMin.x), 0.0f, 1.0f),
+                          std::clamp((mouse.y - imageMin.y) / (imageMax.y - imageMin.y), 0.0f, 1.0f));
+                      };
+
+                      for (uint32_t i = 0; i < mask.count; ++i) {
+                        const Vector4& rect = mask.rects[i];
+                        const ImVec2 rectMin = uvToScreen(Vector2(rect.x, rect.y));
+                        const ImVec2 rectMax = uvToScreen(Vector2(rect.z, rect.w));
+                        drawList->AddRectFilled(rectMin, rectMax, IM_COL32(118, 185, 0, 70));
+                        drawList->AddRect(rectMin, rectMax, IM_COL32(155, 230, 30, 255), 0.0f, 0, 2.0f);
+                      }
+
+                      static bool drawingUvRect = false;
+                      static XXH64_hash_t drawingTextureHash = kEmptyHash;
+                      static Vector2 uvDragStart;
+                      if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                          mask.count < RtxOptions::SubsurfaceUvMask::kMaxRects) {
+                        drawingUvRect = true;
+                        drawingTextureHash = texHash;
+                        uvDragStart = mouseToUv();
+                      }
+
+                      if (drawingUvRect && drawingTextureHash == texHash) {
+                        const Vector2 uvDragEnd = mouseToUv();
+                        const Vector4 preview(
+                          std::min(uvDragStart.x, uvDragEnd.x), std::min(uvDragStart.y, uvDragEnd.y),
+                          std::max(uvDragStart.x, uvDragEnd.x), std::max(uvDragStart.y, uvDragEnd.y));
+                        drawList->AddRect(
+                          uvToScreen(Vector2(preview.x, preview.y)),
+                          uvToScreen(Vector2(preview.z, preview.w)),
+                          IM_COL32(255, 180, 30, 255), 0.0f, 0, 2.0f);
+
+                        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                          drawingUvRect = false;
+                          if ((preview.z - preview.x) > 0.002f && (preview.w - preview.y) > 0.002f &&
+                              mask.count < RtxOptions::SubsurfaceUvMask::kMaxRects) {
+                            mask.rects[mask.count++] = preview;
+                            RtxOptions::subsurfaceOverrideUvRectsStringObject().setDeferred(
+                              RtxOptions::subsurfaceUvMasksToString(masks));
+                          }
+                        }
+                      }
+
+                      ImGui::Text("Regions: %u / %u", mask.count, RtxOptions::SubsurfaceUvMask::kMaxRects);
+                      ImGui::BeginDisabled(mask.count == 0);
+                      if (ImGui::Button("Undo Region##subsurface_uv")) {
+                        --mask.count;
+                        mask.rects[mask.count] = Vector4(0.0f);
+                        RtxOptions::subsurfaceOverrideUvRectsStringObject().setDeferred(
+                          RtxOptions::subsurfaceUvMasksToString(masks));
+                      }
+                      ImGui::SameLine();
+                      if (ImGui::Button("Clear Regions##subsurface_uv")) {
+                        mask = RtxOptions::SubsurfaceUvMask {};
+                        RtxOptions::subsurfaceOverrideUvRectsStringObject().setDeferred(
+                          RtxOptions::subsurfaceUvMasksToString(masks));
+                      }
+                      ImGui::EndDisabled();
+                      if (mask.count == 0) {
+                        ImGui::TextDisabled("UV mode is enabled, but no texels are selected.");
+                      }
+                    }
+                  }
+                }
+
+                ImGui::Unindent();
+              }
+#endif
 
               // Only build the expensive tooltip when the category checkbox is hovered.
               if (showTooltip) {
@@ -2687,6 +2995,7 @@ namespace dxvk {
             if (!objectPickingValues.empty()) {
               const ObjectPickingValue objectPickingValue = objectPickingValues.front();
               meshHash = sceneManager->findMeshHashByObjectPickingValue(objectPickingValue).value_or(kEmptyHash);
+              texture_popup::g_holdingUvTopology = sceneManager->findUvTopologyByObjectPickingValue(objectPickingValue);
               sceneManager->logMeshHashByObjectPickingValue(objectPickingValue);
             }
             texture_popup::g_holdingMeshHash.exchange(meshHash);
@@ -4122,6 +4431,31 @@ namespace dxvk {
         RemixGui::Checkbox("Plasma Ball Effect", &RtxOptions::effectLightPlasmaBallObject());
         ImGui::BeginDisabled(RtxOptions::effectLightPlasmaBall());
         RemixGui::ColorPicker3("Light Color", &RtxOptions::effectLightColorObject());
+        ImGui::EndDisabled();
+        RemixGui::Separator();
+        RemixGui::Checkbox("Enable Light Shaping", &RtxOptions::effectLightShapingEnabledObject());
+        ImGui::BeginDisabled(!RtxOptions::effectLightShapingEnabled());
+        RemixGui::Checkbox("Direction From Geometry", &RtxOptions::effectLightShapingUseGeometryNormalObject());
+        ImGui::BeginDisabled(RtxOptions::effectLightShapingUseGeometryNormal());
+        RemixGui::DragFloat3("Object-Space Direction", &RtxOptions::effectLightShapingDirectionObject(), 0.01f, -1.f, 1.f, "%.3f", sliderFlags);
+        ImGui::EndDisabled();
+        RemixGui::Checkbox("Flip Direction", &RtxOptions::effectLightShapingFlipDirectionObject());
+        RemixGui::DragFloat("Cone Angle", &RtxOptions::effectLightShapingConeAngleObject(), 0.25f, 0.f, 180.f, "%.1f deg", ImGuiSliderFlags_AlwaysClamp);
+        RemixGui::DragFloat("Cone Softness", &RtxOptions::effectLightShapingConeSoftnessObject(), 0.01f, 0.f, 1.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+        RemixGui::DragFloat("Focus Exponent", &RtxOptions::effectLightShapingFocusExponentObject(), 0.05f, 0.f, 64.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        RemixGui::DragFloat("Surface Offset", &RtxOptions::effectLightShapingOffsetObject(), 0.01f, -FLT_MAX, FLT_MAX, "%.3f", sliderFlags);
+        ImGui::EndDisabled();
+        ImGui::Unindent();
+      }
+
+      if (RemixGui::CollapsingHeader("Contact-Hardening Shadows", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+        ImGui::TextWrapped("Uses finite ray-traced light sources: contact edges stay sharp near blockers while penumbrae widen with distance.");
+        RemixGui::Checkbox("Enable Contact Hardening", &RtxOptions::contactHardeningEnabledObject());
+        ImGui::BeginDisabled(!RtxOptions::contactHardeningEnabled());
+        RemixGui::DragFloat("Source Radius Scale", &RtxOptions::contactHardeningSourceRadiusScaleObject(), 0.01f, 0.f, 16.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+        RemixGui::DragFloat("Minimum Sphere Radius", &RtxOptions::contactHardeningMinimumRadiusObject(), 0.01f, 0.f, FLT_MAX, "%.3f", sliderFlags);
+        RemixGui::DragFloat("Distant Angular Scale", &RtxOptions::contactHardeningDistantAngleScaleObject(), 0.01f, 0.f, 16.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
         ImGui::EndDisabled();
         ImGui::Unindent();
       }

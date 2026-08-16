@@ -130,7 +130,8 @@ bool isThinOpaqueSubsurfaceMaterial(OpaqueSurfaceMaterialInteraction opaqueSurfa
 SubsurfaceMaterialInteraction subSurfaceMaterialReadHelper(
   uint subsurfaceMaterialIndex,
   SurfaceInteraction surfaceInteraction,
-  uint16_t samplerIndex)
+  uint16_t samplerIndex,
+  uint primitiveIndex)
 {
   if ((!cb.sssArgs.enableThinOpaque && !cb.sssArgs.enableDiffusionProfile) || subsurfaceMaterialIndex == SURFACE_INDEX_INVALID)
   {
@@ -146,7 +147,7 @@ SubsurfaceMaterialInteraction subSurfaceMaterialReadHelper(
 
   const MemoryPolymorphicSurfaceMaterial memorySubsurfaceMaterial = surfaceMaterialExtensions[subsurfaceMaterialIndex];
   SubsurfaceMaterial subsurfaceMaterial = subsurfaceMaterialCreate(memorySubsurfaceMaterial);
-  return subsurfaceMaterialInteractionCreate(subsurfaceMaterial, surfaceInteraction, samplerIndex);
+  return subsurfaceMaterialInteractionCreate(subsurfaceMaterial, surfaceInteraction, samplerIndex, primitiveIndex);
 }
 
 SubsurfaceMaterialInteraction subSurfaceMaterialReadHelper(

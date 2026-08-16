@@ -998,8 +998,9 @@ namespace dxvk {
     if (!bufferData.indexData && geometryData.indexCount > 0 || !bufferData.positionData)
       return;
 
-    // Find centroid of point cloud.
+    // Find centroid and an area-weighted object-space surface direction.
     Vector3 centroid = Vector3();
+    Vector3 geometryDirection = Vector3();
     uint32_t counter = 0;
     if (geometryData.indexCount > 0) {
       for (uint32_t i = 0; i < geometryData.indexCount; i++) {
@@ -1014,16 +1015,54 @@ namespace dxvk {
       }
     }
     centroid /= (float) counter;
+
+    if (geometryData.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
+      const uint32_t elementCount = geometryData.indexCount > 0 ? geometryData.indexCount : geometryData.vertexCount;
+      for (uint32_t i = 0; i + 2 < elementCount; i += 3) {
+        const uint32_t i0 = geometryData.indexCount > 0 ? bufferData.getIndex(i) : i;
+        const uint32_t i1 = geometryData.indexCount > 0 ? bufferData.getIndex(i + 1) : i + 1;
+        const uint32_t i2 = geometryData.indexCount > 0 ? bufferData.getIndex(i + 2) : i + 2;
+        const Vector3 edge1 = bufferData.getPosition(i1) - bufferData.getPosition(i0);
+        const Vector3 edge2 = bufferData.getPosition(i2) - bufferData.getPosition(i0);
+        geometryDirection += Vector3(
+          edge1.y * edge2.z - edge1.z * edge2.y,
+          edge1.z * edge2.x - edge1.x * edge2.z,
+          edge1.x * edge2.y - edge1.y * edge2.x);
+      }
+    }
     
     const Vector4 renderingPos = input.getTransformData().objectToView * Vector4(centroid.x, centroid.y, centroid.z, 1.0f);
     // Note: False used in getViewToWorld since the renderingPos of the object is defined with respect to the game's object to view
     // matrix, not our freecam's, and as such we want to convert it back to world space using the matching matrix.
     const Vector4 worldPos{ getCamera().getViewToWorld(false) * Vector4d{ renderingPos } };
 
-    RtLightShaping shaping{};
+    Vector3 objectSpaceDirection = RtxOptions::effectLightShapingUseGeometryNormal()
+      ? safeNormalize(geometryDirection, Vector3(0.f, 0.f, 1.f))
+      : safeNormalize(RtxOptions::effectLightShapingDirection(), Vector3(0.f, 0.f, 1.f));
+    const Vector4 renderingDirection = input.getTransformData().objectToView *
+      Vector4(objectSpaceDirection.x, objectSpaceDirection.y, objectSpaceDirection.z, 0.f);
+    const Vector4 worldDirection4 { getCamera().getViewToWorld(false) * Vector4d { renderingDirection } };
+    Vector3 worldDirection = safeNormalize(
+      Vector3(worldDirection4.x, worldDirection4.y, worldDirection4.z), Vector3(0.f, 0.f, 1.f));
+    if (RtxOptions::effectLightShapingFlipDirection()) {
+      worldDirection = -worldDirection;
+    }
+    const bool shapingEnabled = RtxOptions::effectLightShapingEnabled();
+    const RtLightShaping shaping(
+      shapingEnabled,
+      worldDirection,
+      std::cos(std::clamp(RtxOptions::effectLightShapingConeAngle(), 0.f, 180.f) * kDegreesToRadians),
+      std::max(RtxOptions::effectLightShapingConeSoftness(), 0.f),
+      std::max(RtxOptions::effectLightShapingFocusExponent(), 0.f));
 
     float lightRadius = std::max(RtxOptions::effectLightRadius(), 1e-3f);
-    const Vector3 lightPosition { worldPos.x, worldPos.y, worldPos.z };
+    if (RtxOptions::contactHardeningEnabled()) {
+      lightRadius = std::max(
+        lightRadius * std::max(RtxOptions::contactHardeningSourceRadiusScale(), 0.f),
+        RtxOptions::contactHardeningMinimumRadius());
+    }
+    const Vector3 lightPosition = Vector3(worldPos.x, worldPos.y, worldPos.z) +
+      worldDirection * RtxOptions::effectLightShapingOffset();
     Vector3 lightRadiance;
     if (RtxOptions::effectLightPlasmaBall()) {
       // Todo: Make these options more configurable via config options.
@@ -1741,6 +1780,44 @@ namespace dxvk {
       meta.meshHash = drawCallState.getHash(RtxOptions::geometryAssetHashRule());
     }
 
+    // Keep a small CPU-side UV topology snapshot while object picking is active.
+    // This powers mesh-aware material island selection without requiring a USD capture.
+    if (geometry.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST &&
+        geometry.texcoordBuffer.defined() &&
+        geometry.texcoordBuffer.vertexFormat() == VK_FORMAT_R32G32_SFLOAT) {
+      const auto* texcoords = reinterpret_cast<const uint8_t*>(
+        geometry.texcoordBuffer.mapPtr(geometry.texcoordBuffer.offsetFromSlice()));
+      const auto* indices = geometry.indexBuffer.defined()
+        ? reinterpret_cast<const uint8_t*>(geometry.indexBuffer.mapPtr(geometry.indexBuffer.offsetFromSlice()))
+        : nullptr;
+      if (texcoords != nullptr && (!geometry.indexBuffer.defined() || indices != nullptr)) {
+        const uint32_t elementCount = geometry.indexBuffer.defined() ? geometry.indexCount : geometry.vertexCount;
+        auto topology = std::make_shared<UvTopology>();
+        topology->triangles.reserve(elementCount / 3);
+        auto readIndex = [&](uint32_t element) -> uint32_t {
+          if (indices == nullptr) {
+            return element;
+          }
+          if (geometry.indexBuffer.indexType() == VK_INDEX_TYPE_UINT16) {
+            return reinterpret_cast<const uint16_t*>(indices)[element];
+          }
+          return reinterpret_cast<const uint32_t*>(indices)[element];
+        };
+        for (uint32_t primitive = 0; primitive * 3 + 2 < elementCount; ++primitive) {
+          UvTopologyTriangle triangle;
+          triangle.primitiveIndex = primitive;
+          for (uint32_t corner = 0; corner < 3; ++corner) {
+            const uint32_t vertexIndex = readIndex(primitive * 3 + corner);
+            triangle.vertexIndices[corner] = vertexIndex;
+            triangle.uv[corner] = *reinterpret_cast<const Vector2*>(
+              texcoords + static_cast<size_t>(vertexIndex) * geometry.texcoordBuffer.stride());
+          }
+          topology->triangles.push_back(triangle);
+        }
+        meta.uvTopology = std::move(topology);
+      }
+    }
+
     if (RtxOptions::enableInstrumentation()) {
       meta.instrumentation = std::make_shared<DrawCallInstrumentation>();
       DrawCallInstrumentation& instrumentation = *meta.instrumentation;
@@ -1975,6 +2052,9 @@ namespace dxvk {
 
       float subsurfaceRadiusScale = 0.0f;
       float subsurfaceMaxSampleRadius = 0.0f;
+      bool subsurfaceUvMaskEnabled = false;
+      uint8_t subsurfaceUvMaskRectCount = 0;
+      std::array<Vector4, 4> subsurfaceUvMaskRects {};
 
       bool ignoreAlphaChannel = false;
 
@@ -2020,6 +2100,14 @@ namespace dxvk {
       ignoreAlphaChannel = opaqueMaterialData.getIgnoreAlphaChannel();
 
       subsurfaceMeasurementDistance = opaqueMaterialData.getSubsurfaceMeasurementDistance() * RtxOptions::SubsurfaceScattering::surfaceThicknessScale();
+      subsurfaceUvMaskEnabled = opaqueMaterialData.getSubsurfaceUvMaskEnabled();
+      subsurfaceUvMaskRectCount = opaqueMaterialData.getSubsurfaceUvMaskRectCount();
+      subsurfaceUvMaskRects = {
+        opaqueMaterialData.getSubsurfaceUvMaskRect0(),
+        opaqueMaterialData.getSubsurfaceUvMaskRect1(),
+        opaqueMaterialData.getSubsurfaceUvMaskRect2(),
+        opaqueMaterialData.getSubsurfaceUvMaskRect3()
+      };
 
       const bool isSubsurfaceScatteringDiffusionProfile = opaqueMaterialData.getSubsurfaceDiffusionProfile();
 
@@ -2068,6 +2156,9 @@ namespace dxvk {
           subsurfaceVolumetricAnisotropy,
           subsurfaceRadiusScale,
           subsurfaceMaxSampleRadius,
+          subsurfaceUvMaskEnabled,
+          subsurfaceUvMaskRectCount,
+          subsurfaceUvMaskRects,
         };
         subsurfaceMaterialIndex = m_surfaceMaterialExtensionCache.track(subsurfaceMaterial);
       }
@@ -2283,6 +2374,24 @@ namespace dxvk {
       }
     }
     return std::nullopt;
+  }
+
+  std::shared_ptr<const SceneManager::UvTopology> SceneManager::findUvTopologyByObjectPickingValue(uint32_t objectPickingValue) {
+    std::lock_guard lock { m_drawCallMeta.mutex };
+    const int ticksToCheck[] = {
+      m_drawCallMeta.ticker,
+      (m_drawCallMeta.ticker + m_drawCallMeta.activeTicks - 1) % m_drawCallMeta.activeTicks,
+    };
+    for (int tick : ticksToCheck) {
+      if (!m_drawCallMeta.ready[tick]) {
+        continue;
+      }
+      const auto found = m_drawCallMeta.infos[tick].find(objectPickingValue);
+      if (found != m_drawCallMeta.infos[tick].end() && found->second.uvTopology != nullptr) {
+        return found->second.uvTopology;
+      }
+    }
+    return nullptr;
   }
 
   void SceneManager::logMeshHashByObjectPickingValue(uint32_t objectPickingValue) {

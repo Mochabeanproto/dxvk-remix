@@ -177,9 +177,12 @@ struct SubsurfaceMaterial
   f16vec3 singleScatteringAlbedo;
 
   float16_t maxSampleRadius;
-  
+
+  uint16_t uvMaskRectCount;
+  uint2 primitiveRanges[4];
+
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[19];
+  uint16_t data[2];
 };
 
 struct SubsurfaceMaterialInteraction

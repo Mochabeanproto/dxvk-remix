@@ -359,6 +359,11 @@ namespace dxvk {
     // Z axis in this case.
     output.m_zAxis = safeNormalize(originalDirection, Vector3(0.0f, 0.0f, 1.0f));
     output.m_AngleRadians = LightManager::lightConversionDistantLightFixedAngle();
+    if (RtxOptions::contactHardeningEnabled()) {
+      output.m_AngleRadians = std::clamp(
+        output.m_AngleRadians * std::max(RtxOptions::contactHardeningDistantAngleScale(), 0.f),
+        0.f, kPi);
+    }
     output.m_Color = Vector3{ light.Diffuse.r, light.Diffuse.g, light.Diffuse.b };
     output.m_Intensity = LightManager::lightConversionDistantLightFixedIntensity();
 
@@ -395,6 +400,11 @@ namespace dxvk {
 
     output.m_position = originalPosition;
     output.m_Radius = LightManager::lightConversionSphereLightFixedRadius() * RtxOptions::sceneScale();
+    if (RtxOptions::contactHardeningEnabled()) {
+      output.m_Radius = std::max(
+        output.m_Radius * std::max(RtxOptions::contactHardeningSourceRadiusScale(), 0.f),
+        RtxOptions::contactHardeningMinimumRadius() * RtxOptions::sceneScale());
+    }
     output.m_Intensity = LightUtils::calculateIntensity(light, output.m_Radius);
     output.m_Color = Vector3(light.Diffuse.r, light.Diffuse.g, light.Diffuse.b) / originalBrightness;
 

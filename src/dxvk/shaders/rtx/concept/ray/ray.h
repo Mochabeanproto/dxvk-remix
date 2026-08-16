@@ -76,14 +76,14 @@ struct MinimalRayInteraction
   // Note: Cone radius at the hit point (after spreading over a distance from the view ray)
   float coneRadius = 0.f;
   vec3 viewDirection = 0.f;
+  // Retained here so material extensions can gate behavior per source triangle.
+  uint primitiveIndex = 0u;
 };
 
 struct RayInteraction : MinimalRayInteraction
 {
   float hitDistance = 0.f;
   uint barycentricCoordinates = 0u;
-  uint primitiveIndex = 0u;
-
   // Packed surface index + flags (saves 8 bytes vs. separate fields).
   // Bit layout mirrors the customInstanceIndex encoding with an extra frontHit bit:
   //   Bits  0..20 : surfaceIndex  (CUSTOM_INDEX_SURFACE_MASK)

@@ -1919,6 +1919,12 @@ namespace dxvk {
     ScopedCpuProfileZone();
     DxvkPostFx& postFx = m_common->metaPostFx();
     const RtCamera& mainCamera = getSceneManager().getCamera();
+
+    postFx.dispatchNtsc(this,
+      getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
+      RtxOptions::rngSeedWithFrameIndex() ? m_device->getCurrentFrameId() : 0,
+      rtOutput);
+
     if (!postFx.enable()) {
       return;
     }

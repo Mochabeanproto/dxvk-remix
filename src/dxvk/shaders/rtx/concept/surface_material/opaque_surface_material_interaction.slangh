@@ -359,7 +359,8 @@ float opaqueSurfaceMaterialInteractionCalcHeightThroughput(
 SubsurfaceMaterialInteraction subsurfaceMaterialInteractionCreate(
   SubsurfaceMaterial subsurfaceMaterial,
   SurfaceInteraction surfaceInteraction,
-  uint16_t samplerIndex)
+  uint16_t samplerIndex,
+  uint primitiveIndex)
 {
   vec4 transmittanceColor = 0.0f;
   vec4 subsurfaceMeasurementDistance = 0.0f;
@@ -416,6 +417,29 @@ SubsurfaceMaterialInteraction subsurfaceMaterialInteractionCreate(
   subsurfaceMaterialInteraction.volumetricAnisotropy = f16ToSnorm8(subsurfaceMaterial.volumetricAnisotropy);
 
   subsurfaceMaterialInteraction.maxSampleRadius = subsurfaceMaterial.maxSampleRadius != 0.0f ? f16ToUnorm8(max(subsurfaceMaterial.maxSampleRadius, materialSssEpsilon)) : 0;
+
+  // Bit 0 enables mesh-aware UV-island selection. The UI converts a clicked
+  // connected UV island into exact source-primitive ranges.
+  if ((subsurfaceMaterial.flags & 1u) != 0u)
+  {
+    bool insideSelectedIsland = false;
+    [unroll]
+    for (uint i = 0; i < 4; ++i)
+    {
+      if (i < uint(subsurfaceMaterial.uvMaskRectCount))
+      {
+        const uint2 range = subsurfaceMaterial.primitiveRanges[i];
+        insideSelectedIsland = insideSelectedIsland ||
+          (primitiveIndex >= range.x && primitiveIndex <= range.y);
+      }
+    }
+
+    if (!insideSelectedIsland)
+    {
+      subsurfaceMaterialInteraction.measurementDistance = 0.0h;
+      subsurfaceMaterialInteraction.maxSampleRadius = uint8_t(0);
+    }
+  }
 
   return subsurfaceMaterialInteraction;
 }
@@ -948,7 +972,11 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   opaqueSurfaceMaterialInteraction.emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity;
 
   opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction =
-    subSurfaceMaterialReadHelper(opaqueSurfaceMaterial.subsurfaceMaterialIndex, surfaceInteraction, opaqueSurfaceMaterial.samplerIndex);
+    subSurfaceMaterialReadHelper(
+      opaqueSurfaceMaterial.subsurfaceMaterialIndex,
+      surfaceInteraction,
+      opaqueSurfaceMaterial.samplerIndex,
+      minimalRayInteraction.primitiveIndex);
 
   // For an eye, load a secondary texture (iris) and blend on top of primary texture (whites)
   if (cb.eyeArgs.enableEyes && surface.isEye)

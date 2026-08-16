@@ -680,6 +680,9 @@ namespace dxvk {
       Vector3(),  // OpaqueMaterialDefaults::subsurfaceRadius
       0.0f, // OpaqueMaterialDefaults::subsurfaceRadiusScale
       0.0f, // OpaqueMaterialDefaults::subsurfaceMaxSampleRadius
+      false, // OpaqueMaterialDefaults::subsurfaceUvMaskEnabled
+      0, // OpaqueMaterialDefaults::subsurfaceUvMaskRectCount
+      Vector4(), Vector4(), Vector4(), Vector4(), // OpaqueMaterialDefaults::subsurfaceUvMaskRects
       // NOTE: The terrain defines it's own sampler, and these are the modes it uses.
       lss::Mdl::Filter::Linear,
       lss::Mdl::WrapMode::Clamp, // U

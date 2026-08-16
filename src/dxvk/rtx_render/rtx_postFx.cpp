@@ -25,11 +25,13 @@
 #include "dxvk_scoped_annotation.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx/pass/post_fx/post_fx.h"
+#include "rtx/pass/ntsc/ntsc_vhs.h"
 
 #include <rtx_shaders/post_fx.h>
 #include <rtx_shaders/post_fx_highlight.h>
 #include <rtx_shaders/post_fx_motion_blur.h>
 #include <rtx_shaders/post_fx_motion_blur_prefilter.h>
+#include <rtx_shaders/ntsc_vhs.h>
 #include <pxr/base/arch/math.h>
 #include "rtx_imgui.h"
 
@@ -53,6 +55,20 @@ namespace dxvk {
     };
 
     PREWARM_SHADER_PIPELINE(PostFxShader);
+
+    class NtscVhsShader : public ManagedShader
+    {
+      SHADER_SOURCE(NtscVhsShader, VK_SHADER_STAGE_COMPUTE_BIT, ntsc_vhs)
+
+      PUSH_CONSTANTS(NtscVhsArgs)
+
+      BEGIN_PARAMETER()
+        SAMPLER2D(NTSC_VHS_INPUT)
+        RW_TEXTURE2D(NTSC_VHS_OUTPUT)
+      END_PARAMETER()
+    };
+
+    PREWARM_SHADER_PIPELINE(NtscVhsShader);
 
     class PostFxMotionBlurShader : public ManagedShader
     {
@@ -143,6 +159,28 @@ namespace dxvk {
         RemixGui::DragFloat("Vignette Radius", &vignetteRadiusObject(), 0.001f, 0.0f, 1.4f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Vignette Softness", &vignetteSoftnessObject(), 0.001f, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
       }
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("NTSC / VHS");
+    RemixGui::Checkbox("NTSC / VHS Enabled", &ntscEnableObject());
+    if (ntscEnable()) {
+      RemixGui::DragFloat("Luma Bandwidth (MHz)", &ntscLumaBWObject(), 0.01f, 0.50f, 5.00f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Chroma Bandwidth (kHz)", &ntscColorBWObject(), 1.0f, 100.0f, 800.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Edge Ringing", &ntscRingingObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Rainbow Cross-Colour", &ntscRainbowObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Tape Noise", &ntscLumaNoiseObject(), 0.002f, 0.0f, 0.20f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Chroma Noise", &ntscChromaNoiseObject(), 0.002f, 0.0f, 0.20f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Hue / Phase Drift", &ntscHueDriftObject(), 0.005f, 0.0f, 0.50f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Chroma Delay (samples)", &ntscChromaDelayObject(), 0.05f, -8.0f, 8.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragInt("Active Samples", &ntscActiveSamplesObject(), 1.0f, 320, 910, "%d", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragInt("Recorded Scanlines", &ntscRecordedScanlinesObject(), 1.0f, 240, 576, "%d", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Capture Aperture", &ntscCaptureApertureObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Reconstruction Softness", &ntscReconstructionSoftnessObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Dropout Rate", &ntscDropoutRateObject(), 0.01f, 0.0f, 5.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Dropout Length (us)", &ntscDropoutLengthUsObject(), 0.10f, 0.10f, 10.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Head Smear", &ntscHeadSmearObject(), 0.01f, 0.0f, 0.50f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Tape Trail", &ntscTapeTrailObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
     }
   }
 
@@ -363,6 +401,70 @@ namespace dxvk {
     // intermediate texture and copy it back into the final output.
     ctx->copyImage(
       inOutColorTexture.image,
+      { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+      { 0, 0, 0 },
+      rtOutput.m_postFxIntermediateTexture.image,
+      { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+      { 0, 0, 0 },
+      inputSize);
+  }
+
+  void DxvkPostFx::dispatchNtsc(
+    Rc<RtxContext> ctx,
+    Rc<DxvkSampler> linearSampler,
+    const uint32_t frameIdx,
+    const Resources::RaytracingOutput& rtOutput)
+  {
+    if (!ntscEnable()) {
+      return;
+    }
+
+    ScopedGpuProfileZone(ctx, "NTSC VHS");
+    ctx->setFramePassStage(RtxFramePassStage::PostFX);
+
+    const Resources::Resource& inOut = rtOutput.m_finalOutput.resource(Resources::AccessType::ReadWrite);
+    const VkExtent3D& inputSize = inOut.image->info().extent;
+    const VkExtent3D workgroups = util::computeBlockCount(
+      inputSize, VkExtent3D { NTSC_VHS_TILE_SIZE, NTSC_VHS_TILE_SIZE, 1 });
+
+    NtscVhsArgs args = {};
+    args.imageSize = { (uint) inputSize.width, (uint) inputSize.height };
+    args.invImageSize = { 1.0f / (float) inputSize.width, 1.0f / (float) inputSize.height };
+    args.time = (float) GlobalTime::get().absoluteTimeMs() / 1000.0f;
+    args.lumaBW = ntscLumaBW();
+    args.colorBW = ntscColorBW();
+    args.ringing = ntscRinging();
+    args.rainbow = ntscRainbow();
+    args.lumaNoise = ntscLumaNoise();
+    args.chromaNoise = ntscChromaNoise();
+    args.hueDrift = ntscHueDrift();
+    args.chromaDelay = ntscChromaDelay();
+    args.activeSamples = ntscActiveSamples();
+    args.recordedScanlines = ntscRecordedScanlines();
+    args.captureAperture = ntscCaptureAperture();
+    args.reconstructionSoftness = ntscReconstructionSoftness();
+    args.dropoutRate = ntscDropoutRate();
+    args.dropoutLengthUs = ntscDropoutLengthUs();
+    args.headSmear = ntscHeadSmear();
+    args.tapeTrail = ntscTapeTrail();
+    args.frameIdx = frameIdx;
+
+    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+    for (uint passIndex = 0; passIndex < 5; ++passIndex) {
+      args.passIndex = passIndex;
+      const Resources::Resource& input = (passIndex & 1) == 0 ? inOut : rtOutput.m_postFxIntermediateTexture;
+      const Resources::Resource& output = (passIndex & 1) == 0 ? rtOutput.m_postFxIntermediateTexture : inOut;
+      ctx->pushConstants(0, sizeof(args), &args);
+      ctx->bindResourceView(NTSC_VHS_INPUT, input.view, nullptr);
+      ctx->bindResourceSampler(NTSC_VHS_INPUT, linearSampler);
+      ctx->bindResourceView(NTSC_VHS_OUTPUT, output.view, nullptr);
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NtscVhsShader::getShader());
+      ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+    }
+
+    // Five stages leave the reconstructed linear result in the intermediate image.
+    ctx->copyImage(
+      inOut.image,
       { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
       { 0, 0, 0 },
       rtOutput.m_postFxIntermediateTexture.image,

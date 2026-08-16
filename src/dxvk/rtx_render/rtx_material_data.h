@@ -91,6 +91,12 @@
   X(SubsurfaceRadius,                 subsurface_radius,                      Vector3,        Vector3(0.f),               Vector3(65504.f),          Vector3(0.5f, 0.5f, 0.5f)) \
   X(SubsurfaceRadiusScale,            subsurface_radius_scale,                float,          0.f,                        65504.0f,                  1.f) \
   X(SubsurfaceMaxSampleRadius,        subsurface_max_sample_radius,           float,          0.f,                        65504.0f,                  16.f) \
+  X(SubsurfaceUvMaskEnabled,          subsurface_uv_mask_enabled,             bool,           false,                      true,                      false) \
+  X(SubsurfaceUvMaskRectCount,        subsurface_uv_mask_rect_count,          uint8_t,        0,                          4,                         0) \
+  X(SubsurfaceUvMaskRect0,            subsurface_uv_mask_rect_0,              Vector4,        Vector4(0.f),               Vector4(1.f),              Vector4(0.f)) \
+  X(SubsurfaceUvMaskRect1,            subsurface_uv_mask_rect_1,              Vector4,        Vector4(0.f),               Vector4(1.f),              Vector4(0.f)) \
+  X(SubsurfaceUvMaskRect2,            subsurface_uv_mask_rect_2,              Vector4,        Vector4(0.f),               Vector4(1.f),              Vector4(0.f)) \
+  X(SubsurfaceUvMaskRect3,            subsurface_uv_mask_rect_3,              Vector4,        Vector4(0.f),               Vector4(1.f),              Vector4(0.f)) \
   /* Sampler State */ \
   X(FilterMode,                       filter_mode,                            uint8_t,        lss::Mdl::Filter::Nearest,  lss::Mdl::Filter::Linear,  lss::Mdl::Filter::Linear)  \
   X(WrapModeU,                        wrap_mode_u,                            uint8_t,        lss::Mdl::WrapMode::Clamp,  lss::Mdl::WrapMode::Clip,  lss::Mdl::WrapMode::Repeat) \

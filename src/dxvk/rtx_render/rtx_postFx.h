@@ -61,6 +61,14 @@ namespace dxvk {
       const uint32_t frameIdx,
       const Resources::RaytracingOutput& rtOutput);
 
+    // NTSC/VHS phase. Runs after tonemapping and independently of the standard
+    // post-effect master switch, using the same safe ping-pong path as lens effects.
+    void dispatchNtsc(
+      Rc<RtxContext> ctx,
+      Rc<DxvkSampler> linearSampler,
+      const uint32_t frameIdx,
+      const Resources::RaytracingOutput& rtOutput);
+
     void dispatchHighlighting(
       Rc<RtxContext> ctx,
       const Resources::RaytracingOutput& rtOutput,
@@ -74,6 +82,7 @@ namespace dxvk {
     inline bool isMotionBlurEnabled() const { return enable() && enableMotionBlur() && motionBlurSampleCount() > 0 && exposureFraction() > 0.0f; }
     inline bool isChromaticAberrationEnabled() const { return enable() && enableChromaticAberration() && chromaticAberrationAmount() > 0.0f; }
     inline bool isVignetteEnabled() const { return enable() && enableVignette() && vignetteIntensity() > 0.0f; }
+    inline bool isNtscEnabled() const { return ntscEnable(); }
 
     RTX_OPTION_ARGS("rtx.postfx", bool, enable, true, "Enables post-processing effects.",
                     args.environment = "RTX_POST_FX_ENABLE",
@@ -86,6 +95,26 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx.postfx", bool, enableVignette, true, "Enables vignette post-processing effect.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx.postfx", bool, desaturateOthersOnHighlight, true, "If true, desaturare all objects that are not highlighted.");
+
+    RTX_OPTION_ARGS("rtx.ntsc", bool, ntscEnable, false, "Enable the NTSC/VHS composite look.",
+                    args.environment = "RTX_NTSC_ENABLE",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscLumaBW, 3.00f, "VHS luma bandwidth in MHz.", args.minValue = 0.50f, args.maxValue = 5.00f, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscColorBW, 425.00f, "Color-under chroma bandwidth in kHz.", args.minValue = 100.00f, args.maxValue = 800.00f, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscRinging, 0.30f, "Playback peaking and edge-ringing gain.", args.minValue = 0.00f, args.maxValue = 1.00f, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscRainbow, 0.50f, "Soft NTSC cross-colour rainbowing on fine luma detail.", args.minValue = 0.00f, args.maxValue = 1.00f, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscLumaNoise, 0.06f, "Recorded-signal tape grain amplitude.", args.minValue = 0.00f, args.maxValue = 0.20f, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscChromaNoise, 0.035f, "Low-bandwidth noise in the color channels.", args.minValue = 0.00f, args.maxValue = 0.20f, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscHueDrift, 0.06f, "Slow color-subcarrier phase drift in radians.", args.minValue = 0.00f, args.maxValue = 0.50f, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscChromaDelay, 1.50f, "Horizontal color delay in NTSC active-sample units.", args.minValue = -8.00f, args.maxValue = 8.00f, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", uint32_t, ntscActiveSamples, 754, "Horizontal samples in the virtual tape-recording raster.", args.minValue = 320, args.maxValue = 910, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", uint32_t, ntscRecordedScanlines, 480, "Vertical scanlines in the virtual tape-recording raster.", args.minValue = 240, args.maxValue = 576, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscCaptureAperture, 0.40f, "Width of the virtual recording aperture; higher values discard more source detail.", args.minValue = 0.00f, args.maxValue = 1.00f, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscReconstructionSoftness, 0.50f, "Softness of the analog reconstruction from the tape raster to the display.", args.minValue = 0.00f, args.maxValue = 1.00f, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscDropoutRate, 0.00f, "Average tape dropouts per 480-line frame.", args.minValue = 0.00f, args.maxValue = 5.00f, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscDropoutLengthUs, 2.00f, "Average dropout length in microseconds.", args.minValue = 0.10f, args.maxValue = 10.00f, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscHeadSmear, 0.00f, "Worn-head luma-smear strength.", args.minValue = 0.00f, args.maxValue = 0.50f, args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.ntsc", float, ntscTapeTrail, 0.68f, "Causal luma tape trail.", args.minValue = 0.00f, args.maxValue = 1.00f, args.flags = RtxOptionFlags::UserSetting);
 
   private:
     Rc<vk::DeviceFn> m_vkd;

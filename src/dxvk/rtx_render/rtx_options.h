@@ -22,6 +22,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <unordered_set>
 #include <cassert>
 #include <limits>
@@ -260,6 +261,17 @@ namespace dxvk {
                   "rtx.thinWalledOverrideTextures enabled, set via the in-game Texture Selection menu.\n"
                   "Format: hash1:thickness1,hash2:thickness2\n"
                   "Only takes effect for hashes also present in rtx.thinWalledOverrideTextures.");
+    RTX_OPTION("rtx", fast_unordered_set, subsurfaceOverrideTextures, {},
+                  "Legacy opaque textures that should use a mapless thin-opaque subsurface material.\n"
+                  "Textures are assigned through the in-game Texture Selection menu. Optional UV masks\n"
+                  "allow only selected atlas regions to receive subsurface transmission.");
+    RTX_OPTION("rtx", std::string, subsurfaceOverrideThicknessString, "",
+                  "Per-texture measurement distance for mapless thin-opaque subsurface materials.\n"
+                  "Format: hash1:distance1,hash2:distance2. Default: 1.0.");
+    RTX_OPTION("rtx", std::string, subsurfaceOverrideUvRectsString, "",
+                  "Mesh-aware UV-island selections for mapless subsurface materials.\n"
+                  "Format: textureHash@meshHash:firstPrimitive,lastPrimitive|...\n"
+                  "The in-game texture selector authors this value by clicking existing UV islands.");
     RTX_OPTION("rtx", fast_unordered_set, hideInstanceTextures, {},
                   "Textures on draw calls that should be hidden from rendering, but not totally ignored.\n"
                   "This is similar to rtx.ignoreTextures but instead of completely ignoring such draw calls they are only hidden from rendering, allowing for the hidden objects to still appear in captures.\n"
@@ -2473,6 +2485,18 @@ namespace dxvk {
     RTX_OPTION("rtx", float, effectLightIntensity, 1.f, "The intensity of the effect light.  Effect lights can be attached to materials from the remix runtime menu, using the `Add Light to Texture` texture tag in game setup.");
     RTX_OPTION("rtx", float, effectLightRadius, 5.f, "The sphere radius of the effect light.  Effect lights can be attached to materials from the remix runtime menu, using the `Add Light to Texture` texture tag in game setup.");
     RTX_OPTION("rtx", bool, effectLightPlasmaBall, false, "Use plasma ball mode, in this mode the effect light color is ignored.  Effect lights can be attached to materials from the remix runtime menu, using the `Add Light to Texture` texture tag in game setup.");
+    RTX_OPTION("rtx", bool, effectLightShapingEnabled, false, "Shape effect lights into a directional cone instead of emitting uniformly in every direction.");
+    RTX_OPTION("rtx", bool, effectLightShapingUseGeometryNormal, true, "Use the tagged geometry's area-weighted normal as the effect-light cone direction. When disabled, effectLightShapingDirection is interpreted in object space.");
+    RTX_OPTION("rtx", bool, effectLightShapingFlipDirection, false, "Reverse the automatically or manually selected effect-light shaping direction.");
+    RTX_OPTION("rtx", Vector3, effectLightShapingDirection, Vector3(0.f, 0.f, 1.f), "Object-space direction used for effect-light shaping when geometry-normal direction is disabled.");
+    RTX_OPTION("rtx", float, effectLightShapingConeAngle, 45.f, "Effect-light cone half-angle in degrees [0, 180].");
+    RTX_OPTION("rtx", float, effectLightShapingConeSoftness, 0.15f, "Width of the soft transition at the edge of an effect-light cone.");
+    RTX_OPTION("rtx", float, effectLightShapingFocusExponent, 1.f, "Concentrates effect-light energy toward the center of the cone.");
+    RTX_OPTION("rtx", float, effectLightShapingOffset, 0.f, "Moves an effect light along its shaping direction in world units to reduce clipping into the emitting mesh.");
+    RTX_OPTION("rtx", bool, contactHardeningEnabled, true, "Use finite source sizes for physically ray-traced contact-hardening shadows. Shadows remain sharp near blockers and widen with blocker-to-receiver separation.");
+    RTX_OPTION("rtx", float, contactHardeningSourceRadiusScale, 1.f, "Scales source radius for converted point/spot lights and effect lights. Larger values produce wider distant penumbrae while retaining sharp contact edges.");
+    RTX_OPTION("rtx", float, contactHardeningMinimumRadius, 0.01f, "Minimum source radius in world units for converted point/spot lights when contact hardening is enabled.");
+    RTX_OPTION("rtx", float, contactHardeningDistantAngleScale, 1.f, "Scales the angular size of converted distant lights for contact-hardening sun shadows.");
 
     RTX_OPTION("rtx", bool, useObsoleteHashOnTextureUpload, false,
                "Whether or not to use slower XXH64 hash on texture upload.\n"
@@ -2836,6 +2860,86 @@ namespace dxvk {
         result += hashStr;
         result += ":";
         result += std::to_string(pair.second);
+      }
+      return result;
+    }
+
+    struct SubsurfaceUvMask {
+      static constexpr uint32_t kMaxRanges = 4;
+      XXH64_hash_t meshHash = kEmptyHash;
+      std::array<Vector2, kMaxRanges> primitiveRanges {};
+      uint32_t count = 0;
+    };
+
+    static fast_unordered_cache<SubsurfaceUvMask> parseSubsurfaceUvMasks(const std::string& str) {
+      fast_unordered_cache<SubsurfaceUvMask> result;
+      if (str.empty()) {
+        return result;
+      }
+
+      for (const auto& entry : dxvk::str::split(str, ';')) {
+        const size_t separator = entry.find(':');
+        if (separator == std::string::npos) {
+          continue;
+        }
+
+        try {
+          const std::string key = entry.substr(0, separator);
+          const size_t meshSeparator = key.find('@');
+          if (meshSeparator == std::string::npos) {
+            continue;
+          }
+          const XXH64_hash_t hash = std::stoull(key.substr(0, meshSeparator), nullptr, 16);
+          SubsurfaceUvMask mask;
+          mask.meshHash = std::stoull(key.substr(meshSeparator + 1), nullptr, 16);
+          const std::string rangeList = entry.substr(separator + 1);
+          if (!rangeList.empty()) {
+            for (const auto& rangeString : dxvk::str::split(rangeList, '|')) {
+              if (mask.count >= SubsurfaceUvMask::kMaxRanges) {
+                break;
+              }
+              const auto values = dxvk::str::split(rangeString, ',');
+              if (values.size() != 2) {
+                continue;
+              }
+              const uint32_t first = std::stoul(values[0]);
+              const uint32_t last = std::stoul(values[1]);
+              mask.primitiveRanges[mask.count++] = Vector2(
+                static_cast<float>(std::min(first, last)),
+                static_cast<float>(std::max(first, last)));
+            }
+          }
+          result[hash] = mask;
+        } catch (...) {
+          // Skip malformed entries while preserving valid masks.
+        }
+      }
+      return result;
+    }
+
+    static std::string subsurfaceUvMasksToString(const fast_unordered_cache<SubsurfaceUvMask>& masks) {
+      std::string result;
+      bool firstMask = true;
+      for (const auto& [hash, mask] : masks) {
+        if (!firstMask) {
+          result += ";";
+        }
+        firstMask = false;
+
+        char hashString[32];
+        snprintf(hashString, sizeof(hashString), "%016llX", hash);
+        result += hashString;
+        snprintf(hashString, sizeof(hashString), "@%016llX", mask.meshHash);
+        result += hashString;
+        result += ":";
+        for (uint32_t i = 0; i < mask.count; ++i) {
+          if (i != 0) {
+            result += "|";
+          }
+          const Vector2& range = mask.primitiveRanges[i];
+          result += std::to_string(static_cast<uint32_t>(range.x)) + "," +
+                    std::to_string(static_cast<uint32_t>(range.y));
+        }
       }
       return result;
     }
