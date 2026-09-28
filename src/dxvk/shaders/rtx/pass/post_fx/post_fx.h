@@ -75,6 +75,10 @@ struct PostFxArgs {
   bool   enableMotionBlurEmissive;
   float  jitterStrength;
   float  motionBlurDlfgDeduction;
+
+  // Heat haze (fork): screen-space shimmer above hot surfaces (lava/fire), applied in the lens pass.
+  float  heatHazeTime;      // animation time (seconds)
+  float  heatHazeStrength;  // 0 = off
 };
 
 struct PostFxMotionBlurPrefilterArgs {

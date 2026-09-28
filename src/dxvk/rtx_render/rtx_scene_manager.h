@@ -385,6 +385,12 @@ private:
 
   CameraManager m_cameraManager;
 
+  // Distance-LOD tessellation budget, recounted every frame (see the tessellation hook in
+  // onSceneObjectAdded). m_tessBudgetFrameId detects a new frame to reset the accumulators.
+  uint32_t m_tessBudgetFrameId = 0xFFFFFFFFu;
+  uint64_t m_tessFrameVertsUsed = 0;   // live output verts committed this frame
+  uint32_t m_tessNewThisFrame = 0;     // # (re)tessellations dispatched this frame (spread cost)
+
   std::unique_ptr<AssetReplacer> m_pReplacer;
 
   std::unique_ptr<TerrainBaker> m_terrainBaker;

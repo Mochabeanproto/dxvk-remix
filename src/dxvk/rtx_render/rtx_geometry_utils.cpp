@@ -26,6 +26,7 @@
 
 #include <rtx_shaders/gen_tri_list_index_buffer.h>
 #include <rtx_shaders/gpu_skinning.h>
+#include <rtx_shaders/tessellate_displace.h>
 #include <rtx_shaders/view_model_correction.h>
 #include <rtx_shaders/bake_opacity_micromap.h>
 #include <rtx_shaders/decode_and_add_opacity.h>
@@ -41,6 +42,7 @@
 #include "rtx/pass/terrain_baking/decode_and_add_opacity_binding_indices.h"
 #include "rtx/pass/gpu_skinning_binding_indices.h"
 #include "rtx/pass/skinning.h"
+#include "rtx/pass/tessellate_displace_binding_indices.h"
 #include "rtx/pass/smooth_normals_binding_indices.h"
 #include "rtx/pass/smooth_normals.h"
 #include "rtx/pass/gen_tri_list_index_buffer.h"
@@ -80,6 +82,25 @@ namespace dxvk {
     };
 
     PREWARM_SHADER_PIPELINE(SkinningShader);
+
+    class TessellateDisplaceShader : public ManagedShader {
+      SHADER_SOURCE(TessellateDisplaceShader, VK_SHADER_STAGE_COMPUTE_BIT, tessellate_displace)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(BINDING_TD_CONSTANTS)
+        STRUCTURED_BUFFER(BINDING_TD_SRC_POSITION)
+        STRUCTURED_BUFFER(BINDING_TD_SRC_NORMAL)
+        STRUCTURED_BUFFER(BINDING_TD_SRC_TEXCOORD)
+        STRUCTURED_BUFFER(BINDING_TD_SRC_INDEX)
+        RW_STRUCTURED_BUFFER(BINDING_TD_DST_POSITION)
+        RW_STRUCTURED_BUFFER(BINDING_TD_DST_NORMAL)
+        RW_STRUCTURED_BUFFER(BINDING_TD_DST_TEXCOORD)
+        TEXTURE2D(BINDING_TD_HEIGHT_TEXTURE)
+        SAMPLER(BINDING_TD_HEIGHT_SAMPLER)
+      END_PARAMETER()
+    };
+
+    PREWARM_SHADER_PIPELINE(TessellateDisplaceShader);
 
     class ViewModelCorrectionShader : public ManagedShader {
       SHADER_SOURCE(ViewModelCorrectionShader, VK_SHADER_STAGE_COMPUTE_BIT, view_model_correction)
@@ -369,6 +390,154 @@ namespace dxvk {
       }
     }
     ++m_skinningCommands;
+  }
+
+  void RtxGeometryUtils::dispatchTessellateDisplace(
+      const Rc<DxvkContext>& ctx,
+      const RaytraceGeometry& srcGeo,
+      const TextureRef& heightTexture,
+      float displaceScale,
+      uint32_t tessFactor,
+      bool nearestFilter,
+      RaytraceGeometry& outGeo) {
+    ScopedGpuProfileZone(ctx, "tessellateDisplace");
+    DxvkDevice* device = ctx->getDevice().ptr();
+
+    const uint32_t srcTriCount = srcGeo.calculatePrimitiveCount();
+    if (srcTriCount == 0 || !srcGeo.positionBuffer.defined() ||
+        !srcGeo.normalBuffer.defined() || !srcGeo.texcoordBuffer.defined()) {
+      return;
+    }
+
+    // Adaptive tessellation factor. Output expands as srcTris * N^2 * 30 verts (~36 B/vert across
+    // pos/nrm/uv/idx). Rather than SKIP a mesh that would blow the per-mesh VRAM budget (which left
+    // large chunk sections completely flat), pick the largest N <= tessFactor that fits. N>=1 always
+    // fits (a big 8192-tri mesh at N=1 is only ~250 K verts), so EVERY mesh gets some displacement;
+    // small/near meshes still reach the full tessFactor (per-texel), large meshes degrade gracefully.
+    const uint32_t kMaxOutVerts = 16u * 1024u * 1024u; // ~576 MB/mesh; lets a ~2K-tri section reach N=16
+                                                       // (true per-texel). Bounded by the tessellation
+                                                       // budget in rtx_scene_manager.
+    // Each source triangle owns only ~half of its N*N grid (the quad's other triangle owns the rest), so
+    // it emits ceil(N^2/2)+N square voxel columns (10 tris x 3 verts each) — the un-owned cells are
+    // skipped entirely, ~halving BLAS geometry vs emitting them as degenerates. Reserve matches the
+    // shader's slotsPerTri exactly.
+    auto slotsPerTri = [](uint32_t n) -> uint32_t { return (n * n + 1u) / 2u + n; };
+    uint32_t N = std::max(tessFactor, 1u);
+    while (N > 1u && uint64_t(srcTriCount) * slotsPerTri(N) * 30ull > uint64_t(kMaxOutVerts)) {
+      --N;
+    }
+    const uint32_t outVertCount = srcTriCount * slotsPerTri(N) * 10u * 3u;
+
+    auto makeBuffer = [&](VkDeviceSize size, const char* name) -> Rc<DxvkBuffer> {
+      DxvkBufferCreateInfo info = {};
+      info.size = size;
+      info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                   VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                   VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+      info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+      info.access = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+      return device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                  DxvkMemoryStats::Category::RTXAccelerationStructure, name);
+    };
+
+    Rc<DxvkBuffer> posBuf = makeBuffer(VkDeviceSize(outVertCount) * 12u, "TessDisplace Position");
+    Rc<DxvkBuffer> nrmBuf = makeBuffer(VkDeviceSize(outVertCount) * 12u, "TessDisplace Normal");
+    Rc<DxvkBuffer> uvBuf  = makeBuffer(VkDeviceSize(outVertCount) * 8u,  "TessDisplace Texcoord");
+
+    // Trivial sequential index buffer (0,1,2,...): the soup lists each vertex once, but various consumer
+    // paths assume indexed geometry. This pattern is identical for every mesh, so build ONE shared buffer
+    // (sized to the per-mesh ceiling) and let each mesh reference its [0, outVertCount) prefix — avoiding
+    // a per-mesh CPU fill + upload + allocation on every chunk load (a chunk-load hitch).
+    const uint32_t kMaxOutVertsForIndex = uint32_t(kMaxOutVerts);
+    if (m_tessSharedIndexBuffer == nullptr || m_tessSharedIndexCount < outVertCount) {
+      const uint32_t allocCount = std::max(outVertCount, kMaxOutVertsForIndex);
+      m_tessSharedIndexBuffer = makeBuffer(VkDeviceSize(allocCount) * 4u, "TessDisplace SharedIndex");
+      std::vector<uint32_t> sequential(allocCount);
+      for (uint32_t i = 0; i < allocCount; ++i) {
+        sequential[i] = i;
+      }
+      ctx->writeToBuffer(m_tessSharedIndexBuffer, 0, VkDeviceSize(allocCount) * 4u, sequential.data());
+      m_tessSharedIndexCount = allocCount;
+    }
+    Rc<DxvkBuffer> idxBuf = m_tessSharedIndexBuffer;
+
+    outGeo = RaytraceGeometry();
+    outGeo.hashes = srcGeo.hashes;
+    outGeo.vertexCount = outVertCount;
+    outGeo.indexCount = outVertCount;
+    outGeo.cullMode = srcGeo.cullMode;
+    outGeo.frontFace = srcGeo.frontFace;
+    outGeo.positionBuffer = RaytraceBuffer(DxvkBufferSlice(posBuf), 0, 12, VK_FORMAT_R32G32B32_SFLOAT);
+    outGeo.normalBuffer   = RaytraceBuffer(DxvkBufferSlice(nrmBuf), 0, 12, VK_FORMAT_R32G32B32_SFLOAT);
+    outGeo.texcoordBuffer = RaytraceBuffer(DxvkBufferSlice(uvBuf),  0, 8,  VK_FORMAT_R32G32_SFLOAT);
+    outGeo.indexBuffer    = RaytraceBuffer(DxvkBufferSlice(idxBuf), 0, 4, VK_INDEX_TYPE_UINT32);
+    // Keep the buffers alive alongside the geometry.
+    outGeo.historyBuffer[0] = posBuf;
+    outGeo.indexCacheBuffer = idxBuf;
+
+    TessellateDisplaceArgs params = {};
+    params.srcTriangleCount = srcTriCount;
+    params.tessFactor = N;
+    params.displaceScale = displaceScale;
+    params.nearestFilter = nearestFilter ? 1u : 0u;
+    params.srcPositionOffset = srcGeo.positionBuffer.offsetFromSlice();
+    params.srcPositionStride = srcGeo.positionBuffer.stride();
+    params.srcNormalOffset = srcGeo.normalBuffer.offsetFromSlice();
+    params.srcNormalStride = srcGeo.normalBuffer.stride();
+    params.srcTexcoordOffset = srcGeo.texcoordBuffer.offsetFromSlice();
+    params.srcTexcoordStride = srcGeo.texcoordBuffer.stride();
+    params.srcIndexOffset = srcGeo.usesIndices() ? srcGeo.indexBuffer.offsetFromSlice() : 0u;
+    params.useIndices = srcGeo.usesIndices() ? 1u : 0u;
+    params.indexIs32Bit = (srcGeo.usesIndices() && srcGeo.indexBuffer.stride() == 4u) ? 1u : 0u;
+    params.dstPositionOffset = 0; params.dstPositionStride = 12;
+    params.dstNormalOffset = 0;   params.dstNormalStride = 12;
+    params.dstTexcoordOffset = 0; params.dstTexcoordStride = 8;
+    const VkExtent3D texExtent = heightTexture.getImageView()->imageInfo().extent;
+    params.heightTexWidth = texExtent.width;
+    params.heightTexHeight = texExtent.height;
+    params.heightBias = 0.0f;
+
+    const auto& devInfo = device->properties().core.properties;
+    const VkDeviceSize alignment = devInfo.limits.minUniformBufferOffsetAlignment;
+    DxvkBufferSlice cb = m_pCbData->alloc(alignment, sizeof(TessellateDisplaceArgs));
+    memcpy(cb.mapPtr(0), &params, sizeof(TessellateDisplaceArgs));
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(cb.buffer());
+
+    Rc<DxvkSampler> sampler = device->getCommon()->getResources().getSampler(
+      VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+
+    ctx->bindResourceBuffer(BINDING_TD_CONSTANTS, cb);
+    ctx->bindResourceBuffer(BINDING_TD_SRC_POSITION, srcGeo.positionBuffer);
+    ctx->bindResourceBuffer(BINDING_TD_SRC_NORMAL, srcGeo.normalBuffer);
+    ctx->bindResourceBuffer(BINDING_TD_SRC_TEXCOORD, srcGeo.texcoordBuffer);
+    ctx->bindResourceBuffer(BINDING_TD_SRC_INDEX,
+      srcGeo.usesIndices() ? srcGeo.indexBuffer : srcGeo.positionBuffer);
+    ctx->bindResourceBuffer(BINDING_TD_DST_POSITION, outGeo.positionBuffer);
+    ctx->bindResourceBuffer(BINDING_TD_DST_NORMAL, outGeo.normalBuffer);
+    ctx->bindResourceBuffer(BINDING_TD_DST_TEXCOORD, outGeo.texcoordBuffer);
+    ctx->bindResourceView(BINDING_TD_HEIGHT_TEXTURE, heightTexture.getImageView(), nullptr);
+    ctx->bindResourceSampler(BINDING_TD_HEIGHT_SAMPLER, sampler);
+
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, TessellateDisplaceShader::getShader());
+    const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D { srcTriCount, 1, 1 }, VkExtent3D { 64, 1, 1 });
+    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(cb.buffer());
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(posBuf);
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(nrmBuf);
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(uvBuf);
+
+    // The freshly written vertex buffers are consumed later this frame by the BLAS build (via device
+    // address, which bypasses per-resource barrier tracking) and by the ray-tracing shaders that read
+    // geometry. Make the compute writes visible to both, or the BLAS reads uninitialized/partial data
+    // and the GPU faults under load.
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+      VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT);
   }
 
   void RtxGeometryUtils::dispatchViewModelCorrection(

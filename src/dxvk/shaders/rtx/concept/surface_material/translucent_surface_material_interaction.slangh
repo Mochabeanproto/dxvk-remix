@@ -135,6 +135,11 @@ TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteractionCreat
     {
       diffuseColor = transmittanceOrDiffuseSample.rgb;
       diffuseOpacity = transmittanceOrDiffuseSample.a;
+      // Fork: also tint the TRANSMITTANCE by the texture, not just the diffuse coat. Without this a
+      // diffuse-layer translucent (e.g. stained glass) looks coloured but transmits white, so light/shadows
+      // cast through it are uncoloured. Tinting transmittance too makes red/green/blue glass cast coloured
+      // light. Only affects diffuse-layer translucents that actually carry a transmittance/diffuse texture.
+      transmittanceColor = lerp(translucentSurfaceMaterial.transmittanceColor, transmittanceOrDiffuseSample.rgb, transmittanceOrDiffuseSample.a);
     }
   }
 

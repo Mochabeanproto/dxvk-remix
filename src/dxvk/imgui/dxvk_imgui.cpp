@@ -4143,6 +4143,17 @@ namespace dxvk {
       ImGui::Unindent();
     }
 
+    if (RemixGui::CollapsingHeader("Underwater [Fork]", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      ImGui::TextWrapped("Fake underwater look applied to surfaces whose primary ray is inside a medium (i.e. underwater): sun absorption, procedural caustics, and distance murk. A stand-in until real refractive caustics.");
+      RemixGui::DragFloat("Sun Scale (underwater dimming)", &RtxOptions::Underwater::sunScaleObject(), 0.01f, 0.0f, 2.0f);
+      RemixGui::DragFloat("Caustic Scale (higher = finer)", &RtxOptions::Underwater::causticScaleObject(), 0.01f, 0.0f, 10.0f);
+      RemixGui::DragFloat("Caustic Strength", &RtxOptions::Underwater::causticStrengthObject(), 0.01f, 0.0f, 10.0f);
+      RemixGui::DragFloat("Caustic Speed", &RtxOptions::Underwater::causticSpeedObject(), 0.01f, 0.0f, 10.0f);
+      RemixGui::DragFloat3("Murk Absorption R,G,B (higher = denser fog)", &RtxOptions::Underwater::murkAbsorptionObject(), 0.02f, 0.0f, 10.0f, "%.3f", sliderFlags);
+      ImGui::Unindent();
+    }
+
     if (RemixGui::CollapsingHeader("Raytraced Render Target [Experimental]", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
       ImGui::TextWrapped("When a screen in-game is displaying the rasterized results of another camera, this can be used to raytrace that scene.\nNote that the render target texture containing the rasterized results needs to be set to `raytracedRenderTargetTextures` in the texture selection menu.");

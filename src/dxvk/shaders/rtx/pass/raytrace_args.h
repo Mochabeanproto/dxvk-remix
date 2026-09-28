@@ -394,6 +394,7 @@ struct RaytraceArgs {
   uint pomEnableReSTIRGI;
   uint pomEnablePSR;
   uint pomMaxIterations;
+  uint pomNearestFilter;
   uint enableSssTransmission;
   uint enableSssTransmissionSingleScattering;
   uint sssTransmissionBsdfSampleCount;
@@ -418,6 +419,17 @@ struct RaytraceArgs {
   float wboitEnergyLossCompensation;
   float wboitDepthWeightTuning;
   uint wboitEnabled;
+
+  // Underwater effect knobs (fork) -- fake caustics + sun absorption + distance murk (integrator_direct).
+  float underwaterSunScale;
+  float underwaterCausticScale;
+  float underwaterCausticStrength;
+  float underwaterCausticSpeed;
+  float underwaterMurkAbsorbR;
+  float underwaterMurkAbsorbG;
+  float underwaterMurkAbsorbB;
+  float underwaterCameraDepthBelowSea;
+  float underwaterDepthWorldScale;
 
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.

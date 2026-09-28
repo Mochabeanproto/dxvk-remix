@@ -883,6 +883,13 @@ struct BlasEntry {
   // - Data is not directly mappable on CPU
   RaytraceGeometry modifiedGeometryData;
 
+  // Runtime tessellated-displacement ("SPOM") cache: when a height-mapped material is tessellated,
+  // the resulting displaced geometry is stored here (its GPU buffers persist across frames) so it can
+  // be re-registered into the per-frame bindless buffer table every frame without re-allocating. Only
+  // (re)generated when the source geometry actually changes (KBuildBVH / kUpdateBVH).
+  RaytraceGeometry tessellatedGeometryData;
+  bool hasTessellatedGeometry = false;
+
   // Frame when this geometry was seen for the first time
   uint32_t frameCreated = kInvalidFrameIndex;
 

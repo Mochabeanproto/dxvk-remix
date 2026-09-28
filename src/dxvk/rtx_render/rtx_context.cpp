@@ -1205,6 +1205,7 @@ namespace dxvk {
       constants.pomEnablePSR = RtxOptions::Displacement::enablePSR();
     }
     constants.pomMaxIterations = RtxOptions::Displacement::maxIterations();
+    constants.pomNearestFilter = RtxOptions::Displacement::nearestFilter();
 
     constants.totalMipBias = getSceneManager().getTotalMipBias(); 
 
@@ -1358,6 +1359,18 @@ namespace dxvk {
     // plus we also convert this value to a floating point value at some point as well which has 23 bits of precision).
     // Bitwise and used rather than modulus as well for slightly better performance.
     constants.timeSinceStartSeconds = (static_cast<uint32_t>(GlobalTime::get().absoluteTimeMs()) & ((1U << 24U) - 1U)) / 1000.f;
+
+    // Fork: underwater effect knobs (fake caustics + sun absorption + distance murk).
+    constants.underwaterSunScale = RtxOptions::Underwater::sunScale();
+    constants.underwaterCausticScale = RtxOptions::Underwater::causticScale();
+    constants.underwaterCausticStrength = RtxOptions::Underwater::causticStrength();
+    constants.underwaterCausticSpeed = RtxOptions::Underwater::causticSpeed();
+    const Vector3 underwaterMurk = RtxOptions::Underwater::murkAbsorption();
+    constants.underwaterMurkAbsorbR = underwaterMurk.x;
+    constants.underwaterMurkAbsorbG = underwaterMurk.y;
+    constants.underwaterMurkAbsorbB = underwaterMurk.z;
+    constants.underwaterCameraDepthBelowSea = RtxOptions::Underwater::cameraDepthBelowSea();
+    constants.underwaterDepthWorldScale = RtxOptions::Underwater::depthWorldScale();
 
     m_common->metaRtxdiRayQuery().setRaytraceArgs(rtOutput);
     getSceneManager().getLightManager().setRaytraceArgs(

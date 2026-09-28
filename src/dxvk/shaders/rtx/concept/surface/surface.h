@@ -537,6 +537,12 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   vec3 rawBitangent = 0.f;
   vec4 vertexColor = 0.0f;
   float triangleArea = 0.f;
+  // Bounding box (in atlas UV space) of the hit triangle's vertex texcoords = the block sprite's rect.
+  // Used to bound the per-texel heightmap parallax march to the current sprite so it never bleeds into
+  // neighbouring atlas sprites (BetaRT submits the whole block atlas as one material, unlike stock Remix
+  // MC which uses per-block textures — that missing bound is why stock POM looked wrong on the atlas).
+  vec2 spriteUvMin = 0..xx;
+  vec2 spriteUvMax = 1..xx;
 };
 
 struct GBufferMemoryMinimalSurfaceInteraction

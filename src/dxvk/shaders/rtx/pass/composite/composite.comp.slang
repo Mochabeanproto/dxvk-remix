@@ -772,7 +772,13 @@ vec4 compositeResult(
   radianceOutput += remodulatedTotalPrimaryRadiance * volumeAttenuation;
 
   // Note: Shared radiance should always be pre-attenuated so no need to factor that in here - it contains multiple layers of signal so each contribution must be attenuated inline.
-  radianceOutput += sharedRadiance;
+  // MCRTX interop fix: sharedRadiance carries the reflected-sky/through-surface signal for PSR (water)
+  // pixels, accumulated upstream in geometry_resolver. Under the offscreen (forceNoVkSwapchain) interop
+  // path this occasionally resolves to NaN/Inf for refractive-water pixels; added raw it poisons the
+  // composite, and TAAU then smears that one NaN frame into a persistent blown-out mass. Sanitize it at
+  // the source so an invalid sample contributes 0 (the correct "no reflected sky" value) while the real
+  // reflection from the clean secondary buffers still shows. No-op on valid data / in single-native.
+  radianceOutput += sanitize(sharedRadiance, vec3(0.0f));
 
   // Add sky radiance
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);
@@ -847,6 +853,11 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 localIndex : SV_GroupTh
 
   vec4 particleLayerOutput;
   vec4 finalOutput = compositeResult(pixelCoordinate, pixelIsActive, isDirectActive, isIndirectActive, geometryFlags, primaryLinearViewZ, primaryMiss, particleLayerOutput);
+
+  // MCRTX interop fix: catch-all guard so no NaN/Inf reaches the composite output (and thus TAAU /
+  // the interop FINAL_COLOR copy) from any contribution, not just sharedRadiance above. Prevents a
+  // single bad frame from being latched into a persistent blown-out region by temporal accumulation.
+  finalOutput = sanitize(finalOutput, vec4(0.0f));
 
   FinalOutput[pixelCoordinate] = accumulate(pixelCoordinate, finalOutput, cb.accumulationArgs, true, AccumulatedFinalOutput);
 

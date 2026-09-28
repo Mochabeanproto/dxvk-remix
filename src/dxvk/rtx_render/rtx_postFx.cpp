@@ -330,7 +330,7 @@ namespace dxvk {
     if (!enable()) {
       return;
     }
-    if (!isChromaticAberrationEnabled() && !isVignetteEnabled()) {
+    if (!isChromaticAberrationEnabled() && !isVignetteEnabled() && !isHeatHazeEnabled()) {
       return;
     }
 
@@ -350,6 +350,8 @@ namespace dxvk {
     postFxArgs.chromaticCenterAttenuationAmount = chromaticCenterAttenuationAmount();
     postFxArgs.chromaticAberrationScale = calculateChromaticAberrationScale(isChromaticAberrationEnabled() ? chromaticAberrationAmount() : 0.0f);
     postFxArgs.vignetteIntensity = isVignetteEnabled() ? vignetteIntensity() : 0.0f;
+    postFxArgs.heatHazeTime = (float)((uint32_t)GlobalTime::get().absoluteTimeMs() & ((1u << 24) - 1u)) / 1000.0f;
+    postFxArgs.heatHazeStrength = isHeatHazeEnabled() ? heatHazeStrength() : 0.0f;
     postFxArgs.vignetteRadius = vignetteRadius();
     postFxArgs.vignetteSoftness = vignetteSoftness();
 

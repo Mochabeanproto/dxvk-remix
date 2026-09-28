@@ -34,6 +34,7 @@
 #include "rtx/pass/raytrace_args.h"
 #include "math.h"
 #include "rtx_lights.h"
+#include <cstdio>  // [MCRTX SUN DIAG] fopen/fprintf for the temporary sun-light diagnostic
 #include "rtx_intersection_test.h"
 
 /*  Light Manager (blurb)
@@ -386,6 +387,23 @@ namespace dxvk {
       if (m_currentActiveLightCount == LIGHT_INDEX_INVALID) {
         ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Raytracing support more than 65535 lights currently, skipping some lights for now.")));
         break;
+      }
+    }
+
+    // [MCRTX SUN DIAG] Compare interop vs single-native: does the sun DISTANT light survive the
+    // intensity(w<=0) filter into the sampled light set? 30 lines to run/mcrtx_sun_diag.txt. Remove after fix.
+    {
+      static int s_lmDiagCount = 0;
+      if (s_lmDiagCount < 30) {
+        ++s_lmDiagCount;
+        if (FILE* f = std::fopen("mcrtx_sun_diag.txt", "a")) {
+          std::fprintf(f, "linearize: totalLinearized=%zu activeCount=%u distantCount=%u sphereCount=%u extTracked=%zu\n",
+              m_linearizedLights.size(), m_currentActiveLightCount,
+              m_lightTypeRanges[static_cast<uint32_t>(RtLightType::Distant)].count,
+              m_lightTypeRanges[static_cast<uint32_t>(RtLightType::Sphere)].count,
+              m_externallyTrackedLights.size());
+          std::fclose(f);
+        }
       }
     }
 

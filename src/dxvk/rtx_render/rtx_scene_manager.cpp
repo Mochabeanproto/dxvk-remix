@@ -1372,6 +1372,84 @@ namespace dxvk {
       m_instanceManager.notifySceneChanged();
     }
 
+    // Runtime tessellated displacement ("SPOM"): for height-mapped opaque materials, subdivide and
+    // vertex-displace the geometry into REAL bumps, so displaced surfaces produce true silhouettes and
+    // shadows (unlike the shading-only POM path). Gated behind rtx.displacement.tessellate.
+    //
+    // Buffer-lifetime model (critical): the bindless buffer table is CLEARED every frame, so geometry
+    // must be re-registered (updateBufferCache) EVERY frame or its GPU addresses go stale and the GPU
+    // faults. So: (re)tessellate only when the source geometry changes (KBuildBVH / kUpdateBVH) —
+    // re-tessellating every frame was the churn that stalled+crashed — but on the unchanged per-frame
+    // path (kUpdateInstance) re-register the persisted displaced geometry and swap it back in.
+    if (RtxOptions::Displacement::tessellate() &&
+        renderMaterialData.getType() == MaterialDataType::Opaque) {
+      const auto& opaqueMaterialData = renderMaterialData.getOpaqueMaterialData();
+      const bool geometryChanged =
+          (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH);
+
+      // STATIC PREWARM (no dynamic LOD): a section is tessellated ONCE, when its geometry is (re)built,
+      // and then only re-registered every frame — never re-tessellated as the camera moves. This is what
+      // avoids gameplay stutter. The only per-frame state is a LIVE budget (recounted every frame, never
+      // a monotonic cap) so slots free up when sections leave / are rebuilt — which is what lets an edited
+      // section (button, pressure plate, block place/break) re-tessellate instead of staying flat forever.
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      if (frameId != m_tessBudgetFrameId) {
+        m_tessBudgetFrameId = frameId;
+        m_tessFrameVertsUsed = 0;
+        m_tessNewThisFrame = 0;
+      }
+      const uint64_t vertBudget = uint64_t(RtxOptions::Displacement::tessellationBudgetMverts()) * 1000000ull;
+      const uint32_t kMaxNewTessPerFrame = 2;   // spread the world-load / turn burst so fewer heavy BLAS
+                                                // builds land in one frame; still fine for single edits
+      const uint32_t kMaxSrcTrisPerMesh = 8192;
+
+      bool didTessellate = false;
+      if (geometryChanged) {
+        // Fresh (re)built geometry: modifiedGeometryData is the undisplaced source right now. The old
+        // displaced cache (if any) is for the now-stale source, so drop it first.
+        pBlas->hasTessellatedGeometry = false;
+        const TextureRef& heightTexture = opaqueMaterialData.getHeightTexture();
+        const RaytraceGeometry& srcGeo = pBlas->modifiedGeometryData;
+        const uint32_t srcTriCount = srcGeo.calculatePrimitiveCount();
+        const bool canTess = opaqueMaterialData.getDisplaceIn() > 0.f &&
+                             heightTexture.isValid() && !heightTexture.isImageEmpty() &&
+                             srcGeo.texcoordBuffer.defined() && srcGeo.normalBuffer.defined() &&
+                             srcTriCount > 0 && srcTriCount <= kMaxSrcTrisPerMesh &&
+                             m_tessNewThisFrame < kMaxNewTessPerFrame;
+        if (canTess) {
+          const uint32_t N = std::max(RtxOptions::Displacement::tessellationFactor(), 1u);
+          const uint64_t estVerts = std::min<uint64_t>(
+              uint64_t(srcTriCount) * N * N * 30ull, 16ull * 1024 * 1024);
+          if (m_tessFrameVertsUsed + estVerts <= vertBudget) {
+            const float displaceScale = opaqueMaterialData.getDisplaceIn() * RtxOptions::Displacement::displacementFactor();
+            RaytraceGeometry displacedGeo;
+            m_device->getCommon()->metaGeometryUtils().dispatchTessellateDisplace(
+              ctx, srcGeo, heightTexture, displaceScale, N,
+              RtxOptions::Displacement::nearestFilter(), displacedGeo);
+            if (displacedGeo.positionBuffer.defined()) {
+              updateBufferCache(displacedGeo);
+              pBlas->modifiedGeometryData = displacedGeo;
+              pBlas->tessellatedGeometryData = displacedGeo;
+              pBlas->hasTessellatedGeometry = true;
+              pBlas->frameLastUpdated = pBlas->frameLastTouched;
+              m_instanceManager.notifySceneChanged();
+              m_tessFrameVertsUsed += displacedGeo.vertexCount;
+              ++m_tessNewThisFrame;
+              didTessellate = true;
+            }
+          }
+        }
+      }
+
+      // Unchanged geometry: re-register the persisted displaced mesh (bindless table is cleared each
+      // frame) and count it against the live budget. Flat sections are re-registered by the normal path.
+      if (!didTessellate && pBlas->hasTessellatedGeometry) {
+        updateBufferCache(pBlas->tessellatedGeometryData);
+        pBlas->modifiedGeometryData = pBlas->tessellatedGeometryData;
+        m_tessFrameVertsUsed += pBlas->tessellatedGeometryData.vertexCount;
+      }
+    }
+
     // Note: The material data can be modified in instance manager
     RtInstance* instance = m_instanceManager.processSceneObject(m_cameraManager, m_rayPortalManager, *pBlas, drawCallState, renderMaterialData, existingInstance);
 
@@ -2371,6 +2449,10 @@ namespace dxvk {
       state.drawCall.transformData.viewToProjection = Matrix4 { rtCamera.getViewToProjection() };
       state.drawCall.transformData.objectToView = state.drawCall.transformData.worldToView * state.drawCall.transformData.objectToWorld;
     }
+    // Propagate the resolved camera type onto the draw call so downstream instance processing (e.g.
+    // the view-model path that excludes geometry from world shadows/reflections) sees it. Without
+    // this the draw call keeps its default (Main) type and view-model geometry casts world shadows.
+    state.drawCall.cameraType = state.cameraType;
 
     if (!state.gpuInstancingTransforms.empty()) {
       state.drawCall.transformData.instancesToObject =

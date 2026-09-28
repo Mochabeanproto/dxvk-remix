@@ -74,6 +74,10 @@ namespace dxvk {
     inline bool isMotionBlurEnabled() const { return enable() && enableMotionBlur() && motionBlurSampleCount() > 0 && exposureFraction() > 0.0f; }
     inline bool isChromaticAberrationEnabled() const { return enable() && enableChromaticAberration() && chromaticAberrationAmount() > 0.0f; }
     inline bool isVignetteEnabled() const { return enable() && enableVignette() && vignetteIntensity() > 0.0f; }
+    inline bool isHeatHazeEnabled() const { return enable() && enableHeatHaze() && heatHazeStrength() > 0.0f; }
+
+    RTX_OPTION("rtx.postfx", bool, enableHeatHaze, true, "Fork: enable the heat-haze shimmer above hot (lava/fire) surfaces.");
+    RTX_OPTION("rtx.postfx", float, heatHazeStrength, 0.5f, "Fork: strength of the heat-haze shimmer (0 = off).");
 
     RTX_OPTION_ARGS("rtx.postfx", bool, enable, true, "Enables post-processing effects.",
                     args.environment = "RTX_POST_FX_ENABLE",

@@ -516,6 +516,60 @@ void integrateDirectPath(
 
   if (geometryFlags.primarySelectedIntegrationSurface)
   {
+    // --- Fake underwater caustics + sun absorption (fork) ---
+    // Gated PER-SURFACE, not per-camera: SharedMediumMaterialIndex is the medium the primary ray was in
+    // when it reached THIS surface. So a floor seen through the water surface reads "water" and gets the
+    // effect even when the camera is in air; a surface behind a thin glass pane (ray back in air by the
+    // time it lands) reads "air" and does not. Dims the direct sun to approximate absorption and adds a
+    // scrolling procedural caustic pattern projected in world space -- a cheap stand-in for real
+    // refractive caustics (which need photon mapping / MNEE the path tracer lacks). v1 constants are
+    // hardcoded; promote to rtx.conf options once the look is dialled in.
+    const uint surfaceMediumIndex = SharedMediumMaterialIndex[pixelCoordinate];
+    if (surfaceMediumIndex != SURFACE_INDEX_INVALID)
+    {
+      const float causticScale = cb.underwaterCausticScale;      // higher = smaller / finer caustics
+      const float causticSpeed = cb.underwaterCausticSpeed;      // animation speed
+      const float sunScale = cb.underwaterSunScale;              // direct light underwater (absorption approx)
+      const float causticStrength = cb.underwaterCausticStrength; // brightness of the caustic ridges
+
+      const float2 wp0 = (cb.isZUp != 0 ? primarySurfaceInteraction.position.xy
+                                        : primarySurfaceInteraction.position.xz) * causticScale;
+      const float t = cb.timeSinceStartSeconds * causticSpeed;
+      // Two overlapping animated ripple layers (a finer + a coarser octave, drifting in different
+      // directions) interfere into organic, water-like caustic veins; pow() sharpens the bright ridges.
+      float caustic = 0.0f;
+      [unroll] for (int oct = 0; oct < 2; ++oct)
+      {
+        const float freq = (oct == 0) ? 1.0f : 2.1f;
+        const float2 a = wp0 * freq
+            + float2(sin(t * (0.7f + 0.3f * oct)), cos(t * (0.6f + 0.2f * oct))) + float(oct) * 3.7f;
+        const float v = abs(sin(a.x * 1.7f + t) + sin(a.y * 1.3f - t * 0.8f))
+                      + abs(sin((a.x + a.y) * 1.1f + t * 1.3f) + sin((a.x - a.y) * 0.9f - t));
+        caustic += pow(saturate(1.0f - v * 0.25f), 5.0f) * ((oct == 0) ? 0.7f : 0.5f);
+      }
+
+      diffuseLobeRadiance *= (sunScale + causticStrength * caustic);
+      specularLobeRadiance *= sunScale;
+
+      // World-space DEPTH absorption (real ocean physics, per the reference): darken each underwater
+      // surface by how deep IT is below the water surface, with warm wavelengths absorbed first (red, then
+      // green) so deep water trends dark blue. This is view-INDEPENDENT and real-time -- looking down from
+      // the surface you see the seafloor fade dark with depth while shallow blocks stay bright.
+      // Depth is frame-independent: (camera's depth below sea) + (cameraY - surfaceY), correct from any
+      // camera height. cb.underwaterCameraDepthBelowSea is set per-frame by the game.
+      {
+        const float upCam  = (cb.isZUp != 0) ? primaryRay.origin.z : primaryRay.origin.y;
+        const float upSurf = (cb.isZUp != 0) ? primarySurfaceInteraction.position.z : primarySurfaceInteraction.position.y;
+        // Shader world positions are in game units (1 block = 1 meter = 1/sceneScale units), so convert the
+        // vertical distance to blocks before combining with the block-based cameraDepthBelowSea from Java.
+        const float surfaceDepth = max(0.0f, cb.underwaterCameraDepthBelowSea + (upCam - upSurf) * cb.underwaterDepthWorldScale);
+        const float3 depthAbsorb = float3(cb.underwaterMurkAbsorbR, cb.underwaterMurkAbsorbG, cb.underwaterMurkAbsorbB);
+        const float3 transmit = exp(-surfaceDepth * depthAbsorb);
+        diffuseLobeRadiance *= transmit;
+        specularLobeRadiance *= transmit;
+      }
+    }
+
     // Note: Output split direct lighting contribution only if the selected integration surface is primary,
     // the secondary surface uses a combined lighting contribution.
     PrimaryDirectDiffuseLobeRadianceHitDistance[pixelCoordinate] =

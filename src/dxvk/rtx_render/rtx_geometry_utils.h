@@ -52,6 +52,13 @@ namespace dxvk {
     Rc<DxvkContext> m_skinningContext;
     uint32_t m_skinningCommands = 0;
 
+    // Shared sequential index buffer (0,1,2,...) reused by every tessellated-displacement mesh. All
+    // tessellated geometry is a non-indexed soup that just needs identity indices, so one build-once
+    // buffer serves all sections (each references a [0, vertexCount) prefix) — avoiding a large per-mesh
+    // CPU index build + upload + allocation on every chunk load, which was a chunk-load hitch.
+    Rc<DxvkBuffer> m_tessSharedIndexBuffer;
+    uint32_t m_tessSharedIndexCount = 0;
+
   public:
     explicit RtxGeometryUtils(DxvkDevice* pDevice);
     ~RtxGeometryUtils();
@@ -72,6 +79,23 @@ namespace dxvk {
      * \brief Execute a compute shader to perform skinning
      */
     void dispatchSkinning(const DrawCallState& drawCallState, const RaytraceGeometry& geo);
+
+    /**
+     * \brief Tessellate + vertex-displace geometry into REAL displaced triangles ("SPOM").
+     *
+     * Subdivides each source triangle into tessFactor^2 sub-triangles and offsets the generated
+     * vertices outward along the interpolated normal by the sampled heightmap, writing a densely
+     * packed (non-indexed) triangle soup into freshly allocated buffers in \p outGeo. The result is
+     * real geometry that goes into the BLAS, producing true silhouettes/shadows (unlike shading POM).
+     */
+    void dispatchTessellateDisplace(
+      const Rc<DxvkContext>& ctx,
+      const RaytraceGeometry& srcGeo,
+      const TextureRef& heightTexture,
+      float displaceScale,
+      uint32_t tessFactor,
+      bool nearestFilter,
+      RaytraceGeometry& outGeo);
 
     /**
      * \brief Execute a compute shader to perform view model perspective correction

@@ -181,6 +181,21 @@ namespace fork_hooks {
         const Vector3 propDir = (sunDirYUp.y > 0.0f) ? Vector3(-toSun.x, -toSun.y, -toSun.z)
                                                      : Vector3(0.0f, -1.0f, 0.0f);
         ensureLight(g_atmoLights.sun, propDir, sunHalfAngle, radiance, /*cloudShadowed=*/true);
+        // [MCRTX SUN DIAG] Compare interop vs single-native: is the sun distant light created with
+        // nonzero radiance? Writes 30 lines to run/mcrtx_sun_diag.txt then stops. Remove after fix.
+        {
+          static int s_sunDiagCount = 0;
+          if (s_sunDiagCount < 30) {
+            ++s_sunDiagCount;
+            if (FILE* f = std::fopen("mcrtx_sun_diag.txt", "a")) {
+              std::fprintf(f,
+                  "create: sunDirY=%.4f rad=(%.6f,%.6f,%.6f) halfAngle=%.6f radScale=%.4f slot=%s\n",
+                  sunDirYUp.y, radiance.x, radiance.y, radiance.z, sunHalfAngle, radScale,
+                  g_atmoLights.sun ? "set" : "null");
+              std::fclose(f);
+            }
+          }
+        }
       }
 
       // ---- Moons (lazily created; mirror sampleAtmosphereMoonLight radiance) ----

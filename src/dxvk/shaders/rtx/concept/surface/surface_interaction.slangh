@@ -556,6 +556,12 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 
     surfaceInteraction.textureCoordinates = sanitizedInterpolatedTextureCoordinates;
 
+    // Sprite (atlas tile) rect = bbox of the triangle's vertex UVs. Any 3 of a quad's 4 corners already
+    // span the full min/max in U and V, so this is the block sprite's atlas rect. Bounds the per-texel
+    // parallax march to this sprite so it never samples neighbouring atlas tiles.
+    surfaceInteraction.spriteUvMin = min(texcoords[0], min(texcoords[1], texcoords[2]));
+    surfaceInteraction.spriteUvMax = max(texcoords[0], max(texcoords[1], texcoords[2]));
+
     if (GenerateTangents)
     {
       // Note: World positions used here, the original PBRT usage uses model space vertex positions since it calculates the

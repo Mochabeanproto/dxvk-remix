@@ -237,6 +237,16 @@ float3 pomTraceRay(
 
 float pomSampleHeight(uint16_t idx, uint16_t samplerIndex, float2 texcoord)
 {
+  if (cb.pomNearestFilter != 0)
+  {
+    // Snap the coordinate to the texel center so the (bilinear) sample returns that texel's exact
+    // value — i.e. nearest/point filtering. Gives crisp, voxel-like parallax steps instead of the
+    // smooth interpolated slopes bilinear height sampling produces, for blocky/pixel-art content.
+    uint width, height;
+    textures[nonuniformEXT(uint(idx))].GetDimensions(width, height);
+    const float2 texSize = float2(width, height);
+    texcoord = (floor(texcoord * texSize) + 0.5f) / texSize;
+  }
   return 1.0f - textures[nonuniformEXT(uint(idx))].SampleLevel(samplers[nonuniformEXT(uint(samplerIndex))], texcoord, 0).r;
 }
 
@@ -253,6 +263,106 @@ float pomGetNumSamples(float3 direction)
 
   // more samples when viewing from oblique angle
   return lerp(maxSamples, minSamples, abs(direction.z));
+}
+
+// Result of a voxel-heightfield parallax march: the displaced texture coordinate, the depth reached, and
+// the tangent-space normal of the face that was struck (a flat top, or an axis-aligned side wall).
+struct VoxelParallaxHit
+{
+  float2 uv;
+  float3 normalTS;
+  float  depth;
+  bool   isWall;
+};
+
+// Per-texel voxel parallax. Treats the height map as a grid of unit-depth voxel columns and walks the view
+// ray through that grid with a standard 2D DDA (Amanatides & Woo, "A Fast Voxel Traversal Algorithm", 1987),
+// reporting the first solid face hit and its axis-aligned normal (relief mapping — Policarpo, Oliveira &
+// Comba, 2005 — derives the intersection normal the same way). This yields clean, blocky parallax with flat
+// voxel walls and no added geometry. The depth axis mirrors Remix's own POM parametrization (totalHeight /
+// neutralHeight) so rtx.displacement.displacementFactor drives it. Independent implementation from those
+// published techniques on top of Remix's displacement setup.
+VoxelParallaxHit pomVoxelParallax(
+  uint16_t heightTexIdx, uint16_t samplerIdx,
+  float2 baseUv, float2 spriteMin, float2 spriteMax,
+  float3 viewDir, float totalHeight, float neutralHeight, int maxSteps)
+{
+  VoxelParallaxHit hit;
+  hit.uv = baseUv;
+  hit.normalTS = float3(0.0f, 0.0f, 1.0f);
+  hit.depth = 0.0f;
+  hit.isWall = false;
+
+  uint texW, texH;
+  textures[nonuniformEXT(uint(heightTexIdx))].GetDimensions(texW, texH);
+  if (texW == 0u || texH == 0u || abs(viewDir.z) < 1e-4f) { return hit; }
+  const float2 texRes = float2(texW, texH);
+
+  // Full-depth UV shift (uv at depth d = startUv - rayUvFull * d), matching stock POM's step scaling.
+  const float2 rayUvFull = viewDir.xy / viewDir.z * totalHeight;
+  const float2 startUv = baseUv + rayUvFull * (1.0f - neutralHeight);
+
+  const float2 sMin = min(spriteMin, spriteMax);
+  const float2 sMax = max(spriteMin, spriteMax);
+  const float2 clampMin = sMin + 0.5f / texRes;
+  const float2 clampMax = sMax - 0.5f / texRes;
+
+  // Grid-DDA state in texel space. Marching direction is -rayUvFull (uv advances as depth grows).
+  const float2 pos = startUv * texRes;
+  const float2 dir = -rayUvFull * texRes;
+  int2 cell = int2(floor(pos));
+  const int2 stepDir = int2(dir.x >= 0.0f ? 1 : -1, dir.y >= 0.0f ? 1 : -1);
+  const float2 tDelta = float2(
+    abs(dir.x) > 1e-8f ? 1.0f / abs(dir.x) : 1e8f,
+    abs(dir.y) > 1e-8f ? 1.0f / abs(dir.y) : 1e8f);
+  // Depth to the first cell boundary on each axis.
+  float2 tMax = float2(
+    ((dir.x >= 0.0f ? float(cell.x + 1) : float(cell.x)) - pos.x) / (dir.x != 0.0f ? dir.x : 1e-8f),
+    ((dir.y >= 0.0f ? float(cell.y + 1) : float(cell.y)) - pos.y) / (dir.y != 0.0f ? dir.y : 1e-8f));
+
+  float tEnter = 0.0f; // depth at which the ray entered `cell`
+  int lastAxis = -1;   // 0 = last crossed an X boundary, 1 = a Y boundary, -1 = starting cell
+
+  for (int i = 0; i < maxSteps; ++i)
+  {
+    const float2 sampleUv = clamp((float2(cell) + 0.5f) / texRes, clampMin, clampMax);
+    const float voxelTop = pomSampleHeight(heightTexIdx, samplerIdx, sampleUv); // normalized depth of this column's top
+
+    // Entered this column already below its top surface -> we ran into its side wall.
+    if (lastAxis >= 0 && tEnter >= voxelTop)
+    {
+      hit.isWall = true;
+      hit.depth = tEnter;
+      hit.uv = startUv - rayUvFull * tEnter;
+      hit.normalTS = (lastAxis == 0) ? float3(-float(stepDir.x), 0.0f, 0.0f)
+                                     : float3(0.0f, -float(stepDir.y), 0.0f);
+      return hit;
+    }
+
+    const float tExit = min(tMax.x, tMax.y);
+
+    // Ray descends onto this column's top before leaving the cell -> flat top face hit.
+    if (voxelTop <= tExit && voxelTop <= 1.0f)
+    {
+      hit.isWall = false;
+      hit.depth = voxelTop;
+      hit.uv = startUv - rayUvFull * voxelTop;
+      hit.normalTS = float3(0.0f, 0.0f, 1.0f);
+      return hit;
+    }
+
+    if (tExit > 1.0f) { break; } // past max displacement depth with no hit
+
+    // Advance to the next cell along whichever axis boundary is nearest.
+    if (tMax.x < tMax.y) { tEnter = tMax.x; tMax.x += tDelta.x; cell.x += stepDir.x; lastAxis = 0; }
+    else                 { tEnter = tMax.y; tMax.y += tDelta.y; cell.y += stepDir.y; lastAxis = 1; }
+
+    // Stop if the march leaves this block's atlas sprite.
+    if (cell.x < int(floor(sMin.x * texRes.x)) || cell.x > int(floor(sMax.x * texRes.x)) ||
+        cell.y < int(floor(sMin.y * texRes.y)) || cell.y > int(floor(sMax.y * texRes.y))) { break; }
+  }
+
+  return hit; // no hit -> base surface, flat top normal
 }
 
 float3 pomCalculateTexcoord(
@@ -564,24 +674,26 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   opaqueSurfaceMaterialInteraction.flags |= thinFilmEnabled ? OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_THIN_FILM_LAYER : 0;
 
 #ifdef OPAQUE_MATERIAL_USE_POM
+  // Carried out of the parallax march so the side-wall normal can be applied at the shading-normal stage.
+  bool pomIsWall = false;
+  float3 pomWallNormalTS = float3(0.0f, 0.0f, 1.0f);
   if (cb.pomMode != DisplacementMode::Off && opaqueSurfaceMaterial.hasValidDisplacement())
   {
     const mat3 worldToTexture = inverse(transpose(mat3(surfaceInteraction.rawTangent, surfaceInteraction.rawBitangent, surfaceInteraction.geometryNormal)));
-    // TextureGradient x might be along the same direction as the view ray?  make a debug view that shows the dot product between textureGradient.x and viewDirTangentSpace?
+    const vec3 viewDirTextureSpace = normalize(mul(worldToTexture, minimalRayInteraction.viewDirection));
 
-    vec3 viewDirTextureSpace = normalize(mul(worldToTexture, minimalRayInteraction.viewDirection));
-    // Note: -1.f * TextureGradientX has the same x,y direction as viewDirTextureSpace, but calculating the correct z value is non-obvious.
-    // Could potentially remove the need for the worldToTexture transform if a faster way to calculate that z value is found.
-    
-    uint iterations = 0; // unused
-    const vec2 pomTextureCoordinates = pomCalculateTexcoord(
-        opaqueSurfaceMaterial,
-        surfaceInteraction,
-        viewDirTextureSpace,
-        iterations).xy;
+    const float pomTotalHeight = float(opaqueSurfaceMaterial.displaceIn + opaqueSurfaceMaterial.displaceOut);
+    const float pomNeutralHeight = pomTotalHeight > 0.0f ? float(opaqueSurfaceMaterial.displaceIn) / pomTotalHeight : 1.0f;
+
+    const VoxelParallaxHit pomHit = pomVoxelParallax(
+        opaqueSurfaceMaterial.heightTextureIndex, opaqueSurfaceMaterial.samplerIndex,
+        surfaceInteraction.textureCoordinates, surfaceInteraction.spriteUvMin, surfaceInteraction.spriteUvMax,
+        viewDirTextureSpace, pomTotalHeight, pomNeutralHeight, 256);
 
     // WAR for REMIX-3709 - POM sometimes produces NaNs.
-    surfaceInteraction.textureCoordinates = sanitize(pomTextureCoordinates, surfaceInteraction.textureCoordinates);
+    surfaceInteraction.textureCoordinates = sanitize(pomHit.uv, surfaceInteraction.textureCoordinates);
+    pomIsWall = pomHit.isWall;
+    pomWallNormalTS = pomHit.normalTS;
 
     opaqueSurfaceMaterialInteraction.flags |= OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE;
   }
@@ -853,7 +965,21 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   // Transform to desired Opaque Material Interaction values
 
-  opaqueSurfaceMaterialInteraction.shadingNormal = getBentNormal(surfaceInteraction.geometryNormal, normal, -minimalRayInteraction.viewDirection);
+  float3 shadingNormalInput = normal;
+#ifdef OPAQUE_MATERIAL_USE_POM
+  // Voxel relief shading: when the parallax march struck a side wall, replace the (near-flat for MC block
+  // textures) normal-map normal with that wall's axis-aligned face normal so it reads as a lit voxel wall.
+  // Top faces keep the labPBR normal-map normal. The tangent-space face normal is expressed in the same
+  // (rawTangent, rawBitangent, geometryNormal) frame the march ran in, so this is its texture->world map.
+  if (pomIsWall)
+  {
+    shadingNormalInput = normalize(
+      pomWallNormalTS.x * surfaceInteraction.rawTangent +
+      pomWallNormalTS.y * surfaceInteraction.rawBitangent +
+      pomWallNormalTS.z * surfaceInteraction.geometryNormal);
+  }
+#endif
+  opaqueSurfaceMaterialInteraction.shadingNormal = getBentNormal(surfaceInteraction.geometryNormal, shadingNormalInput, -minimalRayInteraction.viewDirection);
   opaqueSurfaceMaterialInteraction.normalDetail = normalDetail;
   // Todo: Shading tangent/bitangent for anisotropy?
   opaqueSurfaceMaterialInteraction.opacity = opacity;

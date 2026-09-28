@@ -450,7 +450,36 @@ namespace dxvk {
       RTX_OPTION("rtx.displacement", float, displacementInFactor, 1.0f, "Scale factor for inwards displacement");
       RTX_OPTION("rtx.displacement", float, displacementOutFactor, 1.0f, "Scale factor for outwards displacement");
       RTX_OPTION("rtx.displacement", uint, maxIterations, 64, "The max number of times the POM raymarch will iterate.");
+      RTX_OPTION("rtx.displacement", bool, nearestFilter, false, "Sample the heightmap with nearest (point) filtering during POM by snapping the sample coordinate to the texel center. Produces crisp, voxel-like parallax steps instead of smoothly interpolated slopes — for blocky / pixel-art content (e.g. Minecraft). Applies to the RaymarchPOM path.");
+      // Runtime displacement via geometry tessellation ("SPOM"): unlike POM (a shading trick on flat
+      // geometry), this subdivides height-mapped triangles and offsets the generated vertices along
+      // the normal, producing REAL displaced geometry in the BLAS — so it yields true silhouettes,
+      // shadows and neighbour occlusion. Heavier (geometry amplification); cross-game.
+      RTX_OPTION("rtx.displacement", bool, tessellate, false, "Displace height-mapped surfaces as REAL tessellated geometry (true silhouettes/shadows), instead of the shading-only POM path. Heavier: each triangle is subdivided tessellationFactor^2 times.");
+      RTX_OPTION("rtx.displacement", uint, tessellationFactor, 4, "Subdivision level N for tessellated displacement: each source triangle becomes N*N sub-triangles. Higher = finer relief but far more geometry.");
+      // Total budget for STATIC-prewarm tessellation. Meshes are tessellated once when their geometry is
+      // (re)built, in first-come order, until this budget is full; the budget is recounted every frame
+      // (live, not a monotonic cap) so slots free as sections unload/rebuild — which is what lets edited
+      // sections re-tessellate instead of staying flat. Raise for more coverage if you have VRAM headroom.
+      RTX_OPTION("rtx.displacement", uint, tessellationBudgetMverts, 128, "Total live tessellated-geometry budget in MILLIONS of output vertices (~36 bytes each; 128 ~= 4.6 GB). Recounted every frame; meshes over budget stay untessellated until room frees up.");
     } displacement;
+
+    // Fork: underwater look (fake caustics + sun absorption + distance murk) applied in the direct-lighting
+    // pass to surfaces whose primary ray was inside a medium (i.e. underwater). See integrator_direct.slangh.
+    struct Underwater {
+      friend class ImGUI;
+      RTX_OPTION("rtx.underwater", float, sunScale, 0.6f, "Direct-light scale on underwater surfaces (approximates the sun being absorbed by water). Lower = darker underwater.");
+      RTX_OPTION("rtx.underwater", float, causticScale, 1.5f, "Caustic pattern world-space frequency. Higher = smaller / finer caustics.");
+      RTX_OPTION("rtx.underwater", float, causticStrength, 1.3f, "Brightness of the caustic ridges added to underwater direct lighting.");
+      RTX_OPTION("rtx.underwater", float, causticSpeed, 1.3f, "Animation speed of the caustic pattern.");
+      RTX_OPTION("rtx.underwater", Vector3, murkAbsorption, Vector3(0.15f, 0.06f, 0.02f), "Per-channel Beer-Lambert absorption per unit of DEPTH below the water surface (red absorbed fastest, blue penetrates furthest -> deep water trends dark blue). Higher = darkens faster with depth.");
+      // Set per-frame by the game (mcrtx): the camera's depth below the water surface (world blocks; signed,
+      // negative above water). Lets the shader compute each surface's true world depth = this + (cameraY - surfaceY).
+      RTX_OPTION("rtx.underwater", float, cameraDepthBelowSea, 0.0f, "Runtime-set: camera depth below the water surface, used to derive per-surface world depth for the underwater darkening. Not a user setting.");
+      // Converts the shader's world-space Y difference into blocks/meters (= rtx.sceneScale; game units->meters,
+      // 1 block = 1 meter). If the depth murk darkens far too fast or not at all, this is the scale to fix.
+      RTX_OPTION("rtx.underwater", float, depthWorldScale, 0.01f, "Multiplier converting the shader's world-space vertical distance into blocks for the depth-based murk (should equal rtx.sceneScale). Lower if it darkens too fast with depth.");
+    } underwater;
 
     RTX_OPTION("rtx", bool, resolvePreCombinedMatrices, true, "");
 

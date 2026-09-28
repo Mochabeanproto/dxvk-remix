@@ -729,6 +729,12 @@ namespace {
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) {
         return CameraType::Sky;
       }
+      // View-model instances must be drawn under the view-model camera so the runtime tags them
+      // (CUSTOM_INDEX_IS_VIEW_MODEL / OBJECT_MASK_VIEWMODEL) and excludes them from world shadows /
+      // reflections, and renders them with the view-model FOV/near-plane (no wall clipping).
+      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL) {
+        return CameraType::ViewModel;
+      }
       return CameraType::Main;
     }
 
